@@ -1,31 +1,60 @@
 use crate::{Epoch, Index};
-use std::{cmp::Ordering, fmt, marker::PhantomData};
-use wgt::Backend;
+use core::{
+    cmp::Ordering,
+    fmt::{self, Debug},
+    hash::Hash,
+    marker::PhantomData,
+    num::NonZeroU64,
+};
+use wgt::WasmNotSendSync;
 
-#[cfg(feature = "id32")]
-type IdType = u32;
-#[cfg(not(feature = "id32"))]
-type IdType = u64;
-#[cfg(feature = "id32")]
-type NonZeroId = std::num::NonZeroU32;
-#[cfg(not(feature = "id32"))]
-type NonZeroId = std::num::NonZeroU64;
-#[cfg(feature = "id32")]
-type ZippedIndex = u16;
-#[cfg(not(feature = "id32"))]
-type ZippedIndex = Index;
+const _: () = {
+    if size_of::<Index>() != 4 {
+        panic!()
+    }
+};
+const _: () = {
+    if size_of::<Epoch>() != 4 {
+        panic!()
+    }
+};
+const _: () = {
+    if size_of::<RawId>() != 8 {
+        panic!()
+    }
+};
 
-const INDEX_BITS: usize = std::mem::size_of::<ZippedIndex>() * 8;
-const EPOCH_BITS: usize = INDEX_BITS - BACKEND_BITS;
-const BACKEND_BITS: usize = 3;
-const BACKEND_SHIFT: usize = INDEX_BITS * 2 - BACKEND_BITS;
-pub const EPOCH_MASK: u32 = (1 << (EPOCH_BITS)) - 1;
-type Dummy = hal::api::Empty;
+/// The raw underlying representation of an identifier.
+#[repr(transparent)]
+#[cfg_attr(
+    any(feature = "serde", feature = "trace"),
+    derive(serde::Serialize),
+    serde(into = "SerialId")
+)]
+#[cfg_attr(
+    any(feature = "serde", feature = "replay"),
+    derive(serde::Deserialize),
+    serde(from = "SerialId")
+)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RawId(NonZeroU64);
+
+impl RawId {
+    /// Zip together an identifier and return its raw underlying representation.
+    pub fn zip(index: Index, epoch: Epoch) -> RawId {
+        let v = (index as u64) | ((epoch as u64) << 32);
+        Self(NonZeroU64::new(v).unwrap())
+    }
+
+    /// Unzip a raw identifier into its components.
+    pub fn unzip(self) -> (Index, Epoch) {
+        (self.0.get() as Index, (self.0.get() >> 32) as Epoch)
+    }
+}
 
 /// An identifier for a wgpu object.
 ///
-/// An `Id<T>` value identifies a value stored in a [`Global`]'s [`Hub`]'s [`Storage`].
-/// `Storage` implements [`Index`] and [`IndexMut`], accepting `Id` values as indices.
+/// An `Id<T>` value identifies a value stored in a [`Global`]'s [`Hub`].
 ///
 /// ## Note on `Id` typing
 ///
@@ -35,239 +64,231 @@ type Dummy = hal::api::Empty;
 /// any backend, but the corresponding resource types ([`Texture<A>`], for
 /// example) are always parameterized by a specific backend `A`.
 ///
-/// So the `T` in `Id<T>` is usually a resource type like `Texture<Empty>`,
-/// where [`Empty`] is the `wgpu_hal` dummy back end. These empty types are
+/// So the `T` in `Id<T>` is usually a resource type like `Texture<Noop>`,
+/// where [`Noop`] is the `wgpu_hal` dummy back end. These empty types are
 /// never actually used, beyond just making sure you access each `Storage` with
 /// the right kind of identifier. The members of [`Hub<A>`] pair up each
-/// `X<Empty>` type with the resource type `X<A>`, for some specific backend
+/// `X<Noop>` type with the resource type `X<A>`, for some specific backend
 /// `A`.
 ///
-/// [`Global`]: crate::hub::Global
+/// [`Global`]: crate::global::Global
 /// [`Hub`]: crate::hub::Hub
 /// [`Hub<A>`]: crate::hub::Hub
-/// [`Storage`]: crate::hub::Storage
 /// [`Texture<A>`]: crate::resource::Texture
-/// [`Index`]: std::ops::Index
-/// [`IndexMut`]: std::ops::IndexMut
 /// [`Registry`]: crate::hub::Registry
-/// [`Empty`]: hal::api::Empty
+/// [`Noop`]: hal::api::Noop
 #[repr(transparent)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize), serde(into = "SerialId"))]
+#[cfg_attr(any(feature = "serde", feature = "trace"), derive(serde::Serialize))]
+#[cfg_attr(any(feature = "serde", feature = "replay"), derive(serde::Deserialize))]
 #[cfg_attr(
-    feature = "replay",
-    derive(serde::Deserialize),
-    serde(from = "SerialId")
+    any(feature = "serde", feature = "trace", feature = "replay"),
+    serde(transparent)
 )]
-#[cfg_attr(
-    all(feature = "serde", not(feature = "trace")),
-    derive(serde::Serialize)
-)]
-#[cfg_attr(
-    all(feature = "serde", not(feature = "replay")),
-    derive(serde::Deserialize)
-)]
-pub struct Id<T>(NonZeroId, PhantomData<T>);
+pub struct Id<T: Marker>(RawId, PhantomData<T>);
 
 // This type represents Id in a more readable (and editable) way.
 #[allow(dead_code)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-#[cfg_attr(feature = "replay", derive(serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 enum SerialId {
     // The only variant forces RON to not ignore "Id"
-    Id(Index, Epoch, Backend),
+    Id(Index, Epoch),
 }
-#[cfg(feature = "trace")]
-impl<T> From<Id<T>> for SerialId {
-    fn from(id: Id<T>) -> Self {
-        let (index, epoch, backend) = id.unzip();
-        Self::Id(index, epoch, backend)
+
+impl From<RawId> for SerialId {
+    fn from(id: RawId) -> Self {
+        let (index, epoch) = id.unzip();
+        Self::Id(index, epoch)
     }
 }
-#[cfg(feature = "replay")]
-impl<T> From<SerialId> for Id<T> {
+
+impl From<SerialId> for RawId {
     fn from(id: SerialId) -> Self {
         match id {
-            SerialId::Id(index, epoch, backend) => TypedId::zip(index, epoch, backend),
+            SerialId::Id(index, epoch) => RawId::zip(index, epoch),
         }
     }
 }
 
-impl<T> Id<T> {
+impl<T> Id<T>
+where
+    T: Marker,
+{
     /// # Safety
     ///
     /// The raw id must be valid for the type.
-    pub unsafe fn from_raw(raw: NonZeroId) -> Self {
+    pub unsafe fn from_raw(raw: RawId) -> Self {
         Self(raw, PhantomData)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn dummy(index: u32) -> Valid<Self> {
-        Valid(Id::zip(index, 1, Backend::Empty))
+    /// Coerce the identifiers into its raw underlying representation.
+    pub fn into_raw(self) -> RawId {
+        self.0
     }
 
-    pub fn backend(self) -> Backend {
-        match self.0.get() >> (BACKEND_SHIFT) as u8 {
-            0 => Backend::Empty,
-            1 => Backend::Vulkan,
-            2 => Backend::Metal,
-            3 => Backend::Dx12,
-            4 => Backend::Dx11,
-            5 => Backend::Gl,
-            _ => unreachable!(),
-        }
+    #[inline]
+    pub fn zip(index: Index, epoch: Epoch) -> Self {
+        Id(RawId::zip(index, epoch), PhantomData)
+    }
+
+    #[inline]
+    pub fn unzip(self) -> (Index, Epoch) {
+        self.0.unzip()
     }
 }
 
-impl<T> Copy for Id<T> {}
+impl<T> Copy for Id<T> where T: Marker {}
 
-impl<T> Clone for Id<T> {
+impl<T> Clone for Id<T>
+where
+    T: Marker,
+{
+    #[inline]
     fn clone(&self) -> Self {
-        Self(self.0, PhantomData)
+        *self
     }
 }
 
-impl<T> fmt::Debug for Id<T> {
+impl<T> Debug for Id<T>
+where
+    T: Marker,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        self.unzip().fmt(formatter)
+        let (index, epoch) = self.unzip();
+        write!(formatter, "Id({index},{epoch})")?;
+        Ok(())
     }
 }
 
-impl<T> std::hash::Hash for Id<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<T> Hash for Id<T>
+where
+    T: Marker,
+{
+    #[inline]
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state);
     }
 }
 
-impl<T> PartialEq for Id<T> {
+impl<T> PartialEq for Id<T>
+where
+    T: Marker,
+{
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T> Eq for Id<T> {}
+impl<T> Eq for Id<T> where T: Marker {}
 
-impl<T> PartialOrd for Id<T> {
+impl<T> PartialOrd for Id<T>
+where
+    T: Marker,
+{
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.0.partial_cmp(&other.0)
+        Some(self.cmp(other))
     }
 }
 
-impl<T> Ord for Id<T> {
+impl<T> Ord for Id<T>
+where
+    T: Marker,
+{
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.cmp(&other.0)
     }
 }
 
-/// An internal ID that has been checked to point to
-/// a valid object in the storages.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-#[cfg_attr(feature = "replay", derive(serde::Deserialize))]
-pub(crate) struct Valid<I>(pub I);
-
-/// Trait carrying methods for direct `Id` access.
+/// Marker trait used to determine which types uniquely identify a resource.
 ///
-/// Most `wgpu-core` clients should not use this trait. Unusual clients that
-/// need to construct `Id` values directly, or access their components, like the
-/// WGPU recording player, may use this trait to do so.
-pub trait TypedId: Copy {
-    fn zip(index: Index, epoch: Epoch, backend: Backend) -> Self;
-    fn unzip(self) -> (Index, Epoch, Backend);
-    fn into_raw(self) -> NonZeroId;
+/// For example, `Device<A>` will have the same type of identifier as
+/// `Device<B>` because `Device<T>` for any `T` defines the same maker type.
+pub trait Marker: 'static + WasmNotSendSync {}
+
+// This allows `()` to be used as a marker type for tests.
+//
+// We don't want these in production code, since they essentially remove type
+// safety, like how identifiers across different types can be compared.
+#[cfg(test)]
+impl Marker for () {}
+
+/// Define identifiers for each resource.
+macro_rules! ids {
+    ($(
+        $(#[$($meta:meta)*])*
+        pub type $name:ident $marker:ident;
+    )*) => {
+        /// Marker types for each resource.
+        pub mod markers {
+            $(
+                #[derive(Debug)]
+                pub enum $marker {}
+                impl super::Marker for $marker {}
+            )*
+        }
+
+        $(
+            $(#[$($meta)*])*
+            pub type $name = Id<self::markers::$marker>;
+        )*
+    }
 }
 
-#[allow(trivial_numeric_casts)]
-impl<T> TypedId for Id<T> {
-    fn zip(index: Index, epoch: Epoch, backend: Backend) -> Self {
-        assert_eq!(0, epoch >> EPOCH_BITS);
-        assert_eq!(0, (index as IdType) >> INDEX_BITS);
-        let v = index as IdType
-            | ((epoch as IdType) << INDEX_BITS)
-            | ((backend as IdType) << BACKEND_SHIFT);
-        Id(NonZeroId::new(v).unwrap(), PhantomData)
-    }
+ids! {
+    pub type AdapterId Adapter;
+    pub type SurfaceId Surface;
+    pub type DeviceId Device;
+    pub type QueueId Queue;
+    pub type BufferId Buffer;
+    pub type StagingBufferId StagingBuffer;
+    pub type TextureViewId TextureView;
+    pub type TextureId Texture;
+    pub type SamplerId Sampler;
+    pub type BindGroupLayoutId BindGroupLayout;
+    pub type PipelineLayoutId PipelineLayout;
+    pub type BindGroupId BindGroup;
+    pub type ShaderModuleId ShaderModule;
+    pub type RenderPipelineId RenderPipeline;
+    pub type ComputePipelineId ComputePipeline;
+    pub type PipelineCacheId PipelineCache;
+    pub type CommandEncoderId CommandEncoder;
+    pub type CommandBufferId CommandBuffer;
+    pub type RenderPassEncoderId RenderPassEncoder;
+    pub type ComputePassEncoderId ComputePassEncoder;
+    pub type RenderBundleEncoderId RenderBundleEncoder;
+    pub type RenderBundleId RenderBundle;
+    pub type QuerySetId QuerySet;
+    pub type BlasId Blas;
+    pub type TlasId Tlas;
+}
 
-    fn unzip(self) -> (Index, Epoch, Backend) {
-        (
-            (self.0.get() as ZippedIndex) as Index,
-            (((self.0.get() >> INDEX_BITS) as ZippedIndex) & (EPOCH_MASK as ZippedIndex)) as Index,
-            self.backend(),
-        )
-    }
+// The CommandBuffer type serves both as encoder and
+// buffer, which is why the 2 functions below exist.
 
-    fn into_raw(self) -> NonZeroId {
-        self.0
+impl CommandEncoderId {
+    pub fn into_command_buffer_id(self) -> CommandBufferId {
+        Id(self.0, PhantomData)
     }
 }
 
-pub type AdapterId = Id<crate::instance::Adapter<Dummy>>;
-pub type SurfaceId = Id<crate::instance::Surface>;
-// Device
-pub type DeviceId = Id<crate::device::Device<Dummy>>;
-pub type QueueId = DeviceId;
-// Resource
-pub type BufferId = Id<crate::resource::Buffer<Dummy>>;
-pub type StagingBufferId = Id<crate::resource::StagingBuffer<Dummy>>;
-pub type TextureViewId = Id<crate::resource::TextureView<Dummy>>;
-pub type TextureId = Id<crate::resource::Texture<Dummy>>;
-pub type SamplerId = Id<crate::resource::Sampler<Dummy>>;
-// Binding model
-pub type BindGroupLayoutId = Id<crate::binding_model::BindGroupLayout<Dummy>>;
-pub type PipelineLayoutId = Id<crate::binding_model::PipelineLayout<Dummy>>;
-pub type BindGroupId = Id<crate::binding_model::BindGroup<Dummy>>;
-// Pipeline
-pub type ShaderModuleId = Id<crate::pipeline::ShaderModule<Dummy>>;
-pub type RenderPipelineId = Id<crate::pipeline::RenderPipeline<Dummy>>;
-pub type ComputePipelineId = Id<crate::pipeline::ComputePipeline<Dummy>>;
-// Command
-pub type CommandEncoderId = CommandBufferId;
-pub type CommandBufferId = Id<crate::command::CommandBuffer<Dummy>>;
-pub type RenderPassEncoderId = *mut crate::command::RenderPass;
-pub type ComputePassEncoderId = *mut crate::command::ComputePass;
-pub type RenderBundleEncoderId = *mut crate::command::RenderBundleEncoder;
-pub type RenderBundleId = Id<crate::command::RenderBundle<Dummy>>;
-pub type QuerySetId = Id<crate::resource::QuerySet<Dummy>>;
-
-#[test]
-fn test_id_backend() {
-    for &b in &[
-        Backend::Empty,
-        Backend::Vulkan,
-        Backend::Metal,
-        Backend::Dx12,
-        Backend::Dx11,
-        Backend::Gl,
-    ] {
-        let id: Id<()> = Id::zip(1, 0, b);
-        let (_id, _epoch, backend) = id.unzip();
-        assert_eq!(id.backend(), b);
-        assert_eq!(backend, b);
+impl CommandBufferId {
+    pub fn into_command_encoder_id(self) -> CommandEncoderId {
+        Id(self.0, PhantomData)
     }
 }
 
 #[test]
 fn test_id() {
-    let last_index = ((1u64 << INDEX_BITS) - 1) as Index;
-    let indexes = [1, last_index / 2 - 1, last_index / 2 + 1, last_index];
-    let epochs = [1, EPOCH_MASK / 2 - 1, EPOCH_MASK / 2 + 1, EPOCH_MASK];
-    let backends = [
-        Backend::Empty,
-        Backend::Vulkan,
-        Backend::Metal,
-        Backend::Dx12,
-        Backend::Dx11,
-        Backend::Gl,
-    ];
+    let indexes = [0, Index::MAX / 2 - 1, Index::MAX / 2 + 1, Index::MAX];
+    let epochs = [1, Epoch::MAX / 2 - 1, Epoch::MAX / 2 + 1, Epoch::MAX];
     for &i in &indexes {
         for &e in &epochs {
-            for &b in &backends {
-                let id: Id<()> = Id::zip(i, e, b);
-                let (index, epoch, backend) = id.unzip();
-                assert_eq!(index, i);
-                assert_eq!(epoch, e);
-                assert_eq!(backend, b);
-            }
+            let id = Id::<()>::zip(i, e);
+            let (index, epoch) = id.unzip();
+            assert_eq!(index, i);
+            assert_eq!(epoch, e);
         }
     }
 }

@@ -1,11 +1,17 @@
-name: Documentation
+name: Docs
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/docs.yml"
   push:
     branches:
-      - master
+      - trunk
 
 env:
+  # This is the MSRV used by `wgpu` itself and all surrounding infrastructure.
+  REPO_MSRV: "1.85"
+
   CARGO_INCREMENTAL: false
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
@@ -15,31 +21,41 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout the code
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --no-self-update --profile=minimal
-
-      - name: Add EGL for OpenGL
+      - name: Install documentation toolchain
         run: |
-          sudo apt-get update -y -qq
-          sudo apt-get install -y -qq libegl1-mesa-dev
+          rustup toolchain install ${{ env.REPO_MSRV }} --no-self-update --profile=minimal
+          rustup override set ${{ env.REPO_MSRV }}
 
-      - name: Build the docs (nightly)
+      - name: Disable debug symbols
+        shell: bash
         run: |
-          cargo +nightly doc --no-deps --lib
+          mkdir -p .cargo
+
+          cat <<EOF >> .cargo/config.toml
+            [profile.dev]
+            debug = false
+          EOF
+
+      - name: Caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: doc-build
+
+      - name: Build the docs
+        run: |
+          cargo doc --no-deps --lib --document-private-items
         env:
           RUSTDOCFLAGS: --cfg docsrs
-
-      - name: Build the docs (stable)
-        run: cargo +stable doc --no-deps --lib
-        if: ${{ failure() }}
+          RUSTC_BOOTSTRAP: 1
 
       - name: Deploy the docs
-        uses: JamesIves/github-pages-deploy-action@v4.4.1
+        uses: JamesIves/github-pages-deploy-action@v4.7.3
+        if: github.ref == 'refs/heads/trunk'
         with:
           token: ${{ secrets.WEB_DEPLOY }}
           folder: target/doc

@@ -1,4 +1,4 @@
-use std::ops::Range;
+use core::ops::Range;
 
 use wgt::{BufferAddress, DynamicOffset, IndexFormat};
 
@@ -10,7 +10,12 @@ pub trait RenderEncoder<'a> {
     /// in the active pipeline when any `draw()` function is called must match the layout of this bind group.
     ///
     /// If the bind group have dynamic offsets, provide them in order of their declaration.
-    fn set_bind_group(&mut self, index: u32, bind_group: &'a BindGroup, offsets: &[DynamicOffset]);
+    fn set_bind_group(
+        &mut self,
+        index: u32,
+        bind_group: Option<&'a BindGroup>,
+        offsets: &[DynamicOffset],
+    );
 
     /// Sets the active render pipeline.
     ///
@@ -29,7 +34,7 @@ pub trait RenderEncoder<'a> {
     /// [`RenderEncoder`] will use `buffer` as one of the source vertex buffers.
     ///
     /// The `slot` refers to the index of the matching descriptor in
-    /// [VertexState::buffers](crate::VertexState::buffers).
+    /// [`VertexState::buffers`](crate::VertexState::buffers).
     ///
     /// [`draw`]: RenderEncoder::draw
     /// [`draw_indexed`]: RenderEncoder::draw_indexed
@@ -50,7 +55,7 @@ pub trait RenderEncoder<'a> {
     ///
     /// The active vertex buffers can be set with [`RenderEncoder::set_vertex_buffer`].
     ///
-    /// The structure expected in `indirect_buffer` must conform to [`DrawIndirect`](crate::util::DrawIndirect).
+    /// The structure expected in `indirect_buffer` must conform to [`DrawIndirectArgs`](crate::util::DrawIndirectArgs).
     fn draw_indirect(&mut self, indirect_buffer: &'a Buffer, indirect_offset: BufferAddress);
 
     /// Draws indexed primitives using the active index buffer and the active vertex buffers,
@@ -59,7 +64,7 @@ pub trait RenderEncoder<'a> {
     /// The active index buffer can be set with [`RenderEncoder::set_index_buffer`], while the active
     /// vertex buffers can be set with [`RenderEncoder::set_vertex_buffer`].
     ///
-    /// The structure expected in `indirect_buffer` must conform to [`DrawIndexedIndirect`](crate::util::DrawIndexedIndirect).
+    /// The structure expected in `indirect_buffer` must conform to [`DrawIndexedIndirectArgs`](crate::util::DrawIndexedIndirectArgs).
     fn draw_indexed_indirect(
         &mut self,
         indirect_buffer: &'a Buffer,
@@ -86,7 +91,7 @@ pub trait RenderEncoder<'a> {
     /// - 4..8 Fragment
     /// ```
     ///
-    /// You would need to upload this in two set_push_constants calls. First for the `Vertex` range, second for the `Fragment` range.
+    /// You would need to upload this in two `set_push_constants` calls. First for the `Vertex` range, second for the `Fragment` range.
     ///
     /// ```text
     /// For the given ranges:
@@ -94,14 +99,19 @@ pub trait RenderEncoder<'a> {
     /// - 4..12 Fragment
     /// ```
     ///
-    /// You would need to upload this in three set_push_constants calls. First for the `Vertex` only range 0..4, second
+    /// You would need to upload this in three `set_push_constants` calls. First for the `Vertex` only range 0..4, second
     /// for the `Vertex | Fragment` range 4..8, third for the `Fragment` range 8..12.
     fn set_push_constants(&mut self, stages: wgt::ShaderStages, offset: u32, data: &[u8]);
 }
 
 impl<'a> RenderEncoder<'a> for RenderPass<'a> {
     #[inline(always)]
-    fn set_bind_group(&mut self, index: u32, bind_group: &'a BindGroup, offsets: &[DynamicOffset]) {
+    fn set_bind_group(
+        &mut self,
+        index: u32,
+        bind_group: Option<&'a BindGroup>,
+        offsets: &[DynamicOffset],
+    ) {
         Self::set_bind_group(self, index, bind_group, offsets);
     }
 
@@ -152,7 +162,12 @@ impl<'a> RenderEncoder<'a> for RenderPass<'a> {
 
 impl<'a> RenderEncoder<'a> for RenderBundleEncoder<'a> {
     #[inline(always)]
-    fn set_bind_group(&mut self, index: u32, bind_group: &'a BindGroup, offsets: &[DynamicOffset]) {
+    fn set_bind_group(
+        &mut self,
+        index: u32,
+        bind_group: Option<&'a BindGroup>,
+        offsets: &[DynamicOffset],
+    ) {
         Self::set_bind_group(self, index, bind_group, offsets);
     }
 

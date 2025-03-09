@@ -3,151 +3,222 @@ resolver = "2"
 members = [
     "cts_runner",
     "deno_webgpu",
-    "dummy",
+
+    # default members
+    "benches",
+    "examples/features",
+    "examples/standalone/*",
+    "lock-analyzer",
+    "naga-cli",
+    "naga",
+    "naga/fuzz",
+    "naga/hlsl-snapshots",
     "player",
-    "wgpu",
+    "tests",
     "wgpu-core",
+    "wgpu-core/platform-deps/*",
     "wgpu-hal",
     "wgpu-info",
+    "wgpu-macros",
     "wgpu-types",
-    "run-wasm"
+    "wgpu",
 ]
 exclude = []
-default-members = ["wgpu", "wgpu-hal", "wgpu-info", "wgpu-types"]
+default-members = [
+    "benches",
+    "examples/features",
+    "examples/standalone/*",
+    "lock-analyzer",
+    "naga-cli",
+    "naga",
+    "naga/fuzz",
+    "naga/hlsl-snapshots",
+    "player",
+    "tests",
+    "wgpu-core",
+    "wgpu-core/platform-deps/*",
+    "wgpu-hal",
+    "wgpu-info",
+    "wgpu-macros",
+    "wgpu-types",
+    "wgpu",
+]
+
+[workspace.lints.clippy]
+ref_as_ptr = "warn"
+# NOTE: disallowed-types is configured in other file: clippy.toml
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.64"
+rust-version = "1.85"
 keywords = ["graphics"]
 license = "MIT OR Apache-2.0"
 homepage = "https://wgpu.rs/"
 repository = "https://github.com/gfx-rs/wgpu"
-version = "0.16.0"
-authors = ["wgpu developers"]
-
-[workspace.dependencies.wgc]
-package = "wgpu-core"
-path = "./wgpu-core"
-version = "0.16"
-
-[workspace.dependencies.wgt]
-package = "wgpu-types"
-path = "./wgpu-types"
-version = "0.16"
-
-[workspace.dependencies.hal]
-package = "wgpu-hal"
-path = "./wgpu-hal"
-version = "0.16"
-
-[workspace.dependencies.naga]
-git = "https://github.com/gfx-rs/naga"
-rev = "b99d58ea435090e561377949f428bce2c18451bb"
-version = "0.12.0"
+version = "24.0.0"
+authors = ["gfx-rs developers"]
 
 [workspace.dependencies]
-arrayvec = "0.7"
-async-executor = "1"
-bitflags = "2"
-bit-vec = "0.6"
-bytemuck = "1.13"
-cargo-run-wasm = "0.3.2"
-cfg_aliases = "0.1"
+naga = { version = "24.0.0", path = "./naga" }
+wgpu = { version = "24.0.0", path = "./wgpu", default-features = false, features = [
+    "serde",
+    "wgsl",
+    "vulkan",
+    "gles",
+    "dx12",
+    "metal",
+    "static-dxc",
+    "webgl",
+    "noop",       # This should be removed if we ever have non-test crates that depend on wgpu
+] }
+wgpu-core = { version = "24.0.0", path = "./wgpu-core" }
+wgpu-hal = { version = "24.0.0", path = "./wgpu-hal" }
+wgpu-macros = { version = "24.0.0", path = "./wgpu-macros" }
+wgpu-test = { version = "24.0.0", path = "./tests" }
+wgpu-types = { version = "24.0.0", path = "./wgpu-types" }
+
+wgpu-core-deps-windows-linux-android = { version = "24.0.0", path = "./wgpu-core/platform-deps/windows-linux-android" }
+wgpu-core-deps-apple = { version = "24.0.0", path = "./wgpu-core/platform-deps/apple" }
+wgpu-core-deps-wasm = { version = "24.0.0", path = "./wgpu-core/platform-deps/wasm" }
+wgpu-core-deps-emscripten = { version = "24.0.0", path = "./wgpu-core/platform-deps/emscripten" }
+
+anyhow = { version = "1.0.96", default-features = false }
+approx = "0.5"
+argh = "0.1.13"
+arrayvec = { version = "0.7.6", default-features = false }
+bincode = "1"
+bit-set = { version = "0.8", default-features = false }
+bit-vec = { version = "0.8", default-features = false }
+bitflags = "2.9"
+bytemuck = { version = "1.21", features = [
+    "derive",
+    "extern_crate_alloc",
+    "min_const_generics",
+] }
+cargo_metadata = "0.19"
+cfg_aliases = "0.2.1"
 cfg-if = "1"
+criterion = "0.5"
 codespan-reporting = "0.11"
-ddsfile = "0.5"
-env_logger = "0.10"
-futures-intrusive = "0.4"
-rustc-hash = "1.1.0"
-glam = "0.21.3"
+ctor = "0.2"
+document-features = "0.2.11"
+encase = "0.10.0"
+env_logger = "0.11"
+fern = "0.7"
+flume = "0.11"
+futures-lite = "2"
+glam = "0.29"
+hashbrown = { version = "0.14.5", default-features = false, features = [
+    "ahash",
+    "inline-more",
+] }
+heck = "0.5.0"
 image = { version = "0.24", default-features = false, features = ["png"] }
-# libloading 0.8 switches from `winapi` to `windows-sys`; permit either
-libloading = ">=0.7,<0.9"
-libc = "0.2"
+indexmap = { version = "2.5.0", default-features = false }
+itertools = { version = "0.13.0" }
+ktx2 = "0.3"
+libc = { version = "0.2", default-features = false }
+libloading = "0.8"
+libtest-mimic = "0.8.1"
 log = "0.4"
-nanorand = { version = "0.7", default-features = false }
-num-traits = { version = "0.2" }
-# Opt out of noise's "default-features" to avoid "image" feature as a dependency count optimization.
-# This will not be required in the next release since it has been removed from the default feature in https://github.com/Razaekel/noise-rs/commit/1af9e1522236b2c584fb9a02150c9c67a5e6bb04#diff-2e9d962a08321605940b5a657135052fbcef87b5e360662bb527c96d9a615542
-noise = { version = "0.7", default-features = false }
+nanorand = { version = "0.7", default-features = false, features = ["wyrand"] }
+noise = "0.9"
+nv-flip = "0.1"
 obj = "0.10"
-# parking_lot 0.12 switches from `winapi` to `windows`; permit either
-parking_lot = ">=0.11,<0.13"
-png = "0.17.8"
-pollster = "0.2"
+# NOTE: once_cell/std is *required* for some commonly-used features, selecting this per crate
+once_cell = { version = "1.20.3", default-features = false }
+# Firefox has 3.4.0 vendored, so we allow that version in our dependencies
+ordered-float = { version = ">=3,<=4.6", default-features = false }
+parking_lot = "0.12.1"
+pico-args = { version = "0.5.0", features = [
+    "eq-separator",
+    "short-space-opt",
+    "combined-flags",
+] }
+png = "0.17.16"
+pollster = "0.4"
+portable-atomic = "1"
 profiling = { version = "1", default-features = false }
-raw-window-handle = "0.5"
-renderdoc-sys = "1.0.0"
+raw-window-handle = { version = "0.6", default-features = false }
+rayon = "1"
+renderdoc-sys = "1.1.0"
 ron = "0.8"
-serde = "1"
-serde_json = "1.0.96"
+# NOTE: rustc-hash v2 is a completely different hasher with different performance characteristics
+# see discussion here (including with some other alternatives): https://github.com/gfx-rs/wgpu/issues/6999
+# (using default-features = false to support no-std build, avoiding any extra features that may require std::collections)
+rustc-hash = { version = "1", default-features = false }
+serde_json = "1.0.139"
+serde = { version = "1", default-features = false }
 smallvec = "1"
 static_assertions = "1.1.0"
-thiserror = "1"
-wgpu = { version = "0.16", path = "./wgpu" }
-winit = "0.27.1"
+strum = { version = "0.26.3", default-features = false, features = ["derive"] }
+trybuild = "1"
+tracy-client = "0.17"
+thiserror = { version = "2", default-features = false }
+walkdir = "2"
+winit = { version = "0.29", features = ["android-native-activity"] }
 
 # Metal dependencies
+metal = "0.31.0"
 block = "0.1"
-foreign-types = "0.3"
-metal = "0.24.0"
-objc = "0.2.5"
 core-graphics-types = "0.1"
+objc = "0.2.5"
 
 # Vulkan dependencies
-ash = "0.37.2"
-gpu-alloc = "0.5"
-gpu-descriptor = "0.2"
 android_system_properties = "0.1.1"
+ash = "0.38.0"
+gpu-alloc = "0.6"
+gpu-descriptor = "0.3"
 
-# DX dependencies
-bit-set = "0.5"
-gpu-allocator = { version = "0.21", default_features = false, features = ["d3d12", "windows", "public-winapi"] }
-d3d12 = "0.5.0"
+# DX12 dependencies
+gpu-allocator = { version = "0.27", default-features = false }
 range-alloc = "0.1"
-winapi = "0.3"
-hassle-rs = "0.10.0"
+mach-dxcompiler-rs = { version = "0.1.4", default-features = false } # remember to increase max_shader_model if applicable
+windows-core = { version = "0.58", default-features = false }
 
 # Gles dependencies
-khronos-egl = "4.1"
-glow = "0.12.1"
-glutin = "0.29.1"
+khronos-egl = "6"
+glow = "0.16"
+glutin = { version = "0.31", default-features = false }
+glutin-winit = { version = "0.4", default-features = false }
+glutin_wgl_sys = "0.6"
+
+# DX12 and GLES dependencies
+windows = { version = "0.58", default-features = false }
 
 # wasm32 dependencies
 console_error_panic_hook = "0.1.7"
-console_log = "0.2"
-js-sys = "0.3.61"
-wasm-bindgen = "0.2.84"
-wasm-bindgen-futures = "0.4.34"
+console_log = "1"
+js-sys = { version = "0.3.70", default-features = false }
+wasm-bindgen = "0.2.97"
+wasm-bindgen-futures = "0.4.45"
 wasm-bindgen-test = "0.3"
-web-sys = "0.3.61"
+web-sys = { version = "0.3.74", default-features = false }
+web-time = "1.1.0"
 
 # deno dependencies
-deno_console = "0.92.0"
-deno_core = "0.174.0"
-deno_url = "0.92.0"
-deno_web = "0.123.0"
-deno_webidl = "0.92.0"
-deno_webgpu = { path = "./deno_webgpu" }
-tokio = "1.25.0"
-termcolor = "1.2.0"
-wgpu-core = { path = "./wgpu-core" }
-wgpu-types = { path = "./wgpu-types" }
+deno_console = "0.190.0"
+deno_core = "0.336.0"
+deno_url = "0.190.0"
+deno_web = "0.221.0"
+deno_webidl = "0.190.0"
+deno_webgpu = { version = "0.157.0", path = "./deno_webgpu" }
+deno_unsync = "0.4.2"
+deno_error = "0.5.5"
+tokio = "1.41.1"
+termcolor = "1.4.1"
 
-[patch."https://github.com/gfx-rs/naga"]
-#naga = { path = "../naga" }
+# android dependencies
+ndk-sys = "0.5.0"
 
-[patch."https://github.com/zakarumych/gpu-descriptor"]
-#gpu-descriptor = { path = "../gpu-descriptor/gpu-descriptor" }
-
-[patch."https://github.com/zakarumych/gpu-alloc"]
-#gpu-alloc = { path = "../gpu-alloc/gpu-alloc" }
-
+# These overrides allow our examples to explicitly depend on release crates
 [patch.crates-io]
-#naga = { path = "../naga" }
-#glow = { path = "../glow" }
-#d3d12 = { path = "../d3d12-rs" }
-#metal = { path = "../metal-rs" }
-#web-sys = { path = "../wasm-bindgen/crates/web-sys" }
-#js-sys = { path = "../wasm-bindgen/crates/js-sys" }
-#wasm-bindgen = { path = "../wasm-bindgen" }
+wgpu = { path = "./wgpu" }
+
+[profile.release]
+lto = "thin"
+debug = true
+
+# Speed up image comparison even in debug builds
+[profile.dev.package."nv-flip-sys"]
+opt-level = 3

@@ -1,7 +1,9 @@
 use super::{InitTracker, MemoryInitKind};
-use crate::{id::TextureId, track::TextureSelector};
+use crate::resource::Texture;
+use alloc::{sync::Arc, vec::Vec};
 use arrayvec::ArrayVec;
-use std::ops::Range;
+use core::ops::Range;
+use wgt::TextureSelector;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TextureInitRange {
@@ -36,7 +38,7 @@ impl From<TextureSelector> for TextureInitRange {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TextureInitTrackerAction {
-    pub(crate) id: TextureId,
+    pub(crate) texture: Arc<Texture>,
     pub(crate) range: TextureInitRange,
     pub(crate) kind: MemoryInitKind,
 }
@@ -51,7 +53,7 @@ pub(crate) struct TextureInitTracker {
 impl TextureInitTracker {
     pub(crate) fn new(mip_level_count: u32, depth_or_array_layers: u32) -> Self {
         TextureInitTracker {
-            mips: std::iter::repeat(TextureLayerInitTracker::new(depth_or_array_layers))
+            mips: core::iter::repeat(TextureLayerInitTracker::new(depth_or_array_layers))
                 .take(mip_level_count as usize)
                 .collect(),
         }
@@ -61,10 +63,10 @@ impl TextureInitTracker {
         &self,
         action: &TextureInitTrackerAction,
     ) -> Option<TextureInitTrackerAction> {
-        let mut mip_range_start = std::usize::MAX;
-        let mut mip_range_end = std::usize::MIN;
-        let mut layer_range_start = std::u32::MAX;
-        let mut layer_range_end = std::u32::MIN;
+        let mut mip_range_start = usize::MAX;
+        let mut mip_range_end = usize::MIN;
+        let mut layer_range_start = u32::MAX;
+        let mut layer_range_end = u32::MIN;
 
         for (i, mip_tracker) in self
             .mips
@@ -85,7 +87,7 @@ impl TextureInitTracker {
 
         if mip_range_start < mip_range_end && layer_range_start < layer_range_end {
             Some(TextureInitTrackerAction {
-                id: action.id,
+                texture: action.texture.clone(),
                 range: TextureInitRange {
                     mip_range: mip_range_start as u32..mip_range_end as u32,
                     layer_range: layer_range_start..layer_range_end,

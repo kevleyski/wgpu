@@ -1,7 +1,20 @@
-use glow::HasContext;
-use parking_lot::{Mutex, MutexGuard};
+#![allow(clippy::std_instead_of_alloc, clippy::std_instead_of_core)]
 
-use std::{ffi, os::raw, ptr, sync::Arc, time::Duration};
+use std::{
+    ffi,
+    mem::ManuallyDrop,
+    os::raw,
+    ptr,
+    rc::Rc,
+    string::String,
+    sync::{Arc, LazyLock},
+    time::Duration,
+    vec::Vec,
+};
+
+use glow::HasContext;
+use hashbrown::HashMap;
+use parking_lot::{MappedMutexGuard, Mutex, MutexGuard, RwLock};
 
 /// The amount of time to wait while trying to obtain a lock to the adapter context
 const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 1;
@@ -21,15 +34,17 @@ const EGL_GL_COLORSPACE_SRGB_KHR: u32 = 0x3089;
 type XOpenDisplayFun =
     unsafe extern "system" fn(display_name: *const raw::c_char) -> *mut raw::c_void;
 
+type XCloseDisplayFun = unsafe extern "system" fn(display: *mut raw::c_void) -> raw::c_int;
+
 type WlDisplayConnectFun =
     unsafe extern "system" fn(display_name: *const raw::c_char) -> *mut raw::c_void;
 
 type WlDisplayDisconnectFun = unsafe extern "system" fn(display: *const raw::c_void);
 
-#[cfg(not(target_os = "emscripten"))]
+#[cfg(not(Emscripten))]
 type EglInstance = khronos_egl::DynamicInstance<khronos_egl::EGL1_4>;
 
-#[cfg(target_os = "emscripten")]
+#[cfg(Emscripten)]
 type EglInstance = khronos_egl::Instance<khronos_egl::Static>;
 
 type WlEglWindowCreateFun = unsafe extern "system" fn(
@@ -47,16 +62,6 @@ type WlEglWindowResizeFun = unsafe extern "system" fn(
 );
 
 type WlEglWindowDestroyFun = unsafe extern "system" fn(window: *const raw::c_void);
-
-#[cfg(target_os = "android")]
-extern "C" {
-    pub fn ANativeWindow_setBuffersGeometry(
-        window: *mut raw::c_void,
-        width: i32,
-        height: i32,
-        format: i32,
-    ) -> i32;
-}
 
 type EglLabel = *const raw::c_void;
 
@@ -112,13 +117,61 @@ unsafe extern "system" fn egl_debug_proc(
     );
 }
 
-fn open_x_display() -> Option<(ptr::NonNull<raw::c_void>, libloading::Library)> {
-    log::info!("Loading X11 library to get the current display");
+/// A simple wrapper around an X11 or Wayland display handle.
+/// Since the logic in this file doesn't actually need to directly
+/// persist a wayland connection handle, the only load-bearing
+/// enum variant is the X11 variant
+#[derive(Debug)]
+enum DisplayRef {
+    X11(ptr::NonNull<raw::c_void>),
+    Wayland,
+}
+
+impl DisplayRef {
+    /// Convenience for getting the underlying pointer
+    fn as_ptr(&self) -> *mut raw::c_void {
+        match *self {
+            Self::X11(ptr) => ptr.as_ptr(),
+            Self::Wayland => unreachable!(),
+        }
+    }
+}
+
+/// DisplayOwner ties the lifetime of the system display handle
+/// to that of the loaded library.
+/// It implements Drop to ensure that the display handle is closed
+/// prior to unloading the library so that we don't leak the
+/// associated file descriptors
+#[derive(Debug)]
+struct DisplayOwner {
+    library: libloading::Library,
+    display: DisplayRef,
+}
+
+impl Drop for DisplayOwner {
+    fn drop(&mut self) {
+        match self.display {
+            DisplayRef::X11(ptr) => unsafe {
+                let func: libloading::Symbol<XCloseDisplayFun> =
+                    self.library.get(c"XCloseDisplay".to_bytes()).unwrap();
+                func(ptr.as_ptr());
+            },
+            DisplayRef::Wayland => {}
+        }
+    }
+}
+
+fn open_x_display() -> Option<DisplayOwner> {
+    log::debug!("Loading X11 library to get the current display");
     unsafe {
-        let library = libloading::Library::new("libX11.so").ok()?;
-        let func: libloading::Symbol<XOpenDisplayFun> = library.get(b"XOpenDisplay").unwrap();
+        let library = find_library(&["libX11.so.6", "libX11.so"])?;
+        let func: libloading::Symbol<XOpenDisplayFun> =
+            library.get(c"XOpenDisplay".to_bytes()).unwrap();
         let result = func(ptr::null());
-        ptr::NonNull::new(result).map(|ptr| (ptr, library))
+        ptr::NonNull::new(result).map(|ptr| DisplayOwner {
+            display: DisplayRef::X11(ptr),
+            library,
+        })
     }
 }
 
@@ -132,22 +185,27 @@ unsafe fn find_library(paths: &[&str]) -> Option<libloading::Library> {
     None
 }
 
-fn test_wayland_display() -> Option<libloading::Library> {
+fn test_wayland_display() -> Option<DisplayOwner> {
     /* We try to connect and disconnect here to simply ensure there
      * is an active wayland display available.
      */
-    log::info!("Loading Wayland library to get the current display");
+    log::debug!("Loading Wayland library to get the current display");
     let library = unsafe {
         let client_library = find_library(&["libwayland-client.so.0", "libwayland-client.so"])?;
-        let wl_display_connect: libloading::Symbol<WlDisplayConnectFun> =
-            client_library.get(b"wl_display_connect").unwrap();
-        let wl_display_disconnect: libloading::Symbol<WlDisplayDisconnectFun> =
-            client_library.get(b"wl_display_disconnect").unwrap();
+        let wl_display_connect: libloading::Symbol<WlDisplayConnectFun> = client_library
+            .get(c"wl_display_connect".to_bytes())
+            .unwrap();
+        let wl_display_disconnect: libloading::Symbol<WlDisplayDisconnectFun> = client_library
+            .get(c"wl_display_disconnect".to_bytes())
+            .unwrap();
         let display = ptr::NonNull::new(wl_display_connect(ptr::null()))?;
         wl_display_disconnect(display.as_ptr());
         find_library(&["libwayland-egl.so.1", "libwayland-egl.so"])?
     };
-    Some(library)
+    Some(DisplayOwner {
+        library,
+        display: DisplayRef::Wayland,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,7 +249,7 @@ fn choose_config(
     let mut attributes = Vec::with_capacity(9);
     for tier_max in (0..tiers.len()).rev() {
         let name = tiers[tier_max].0;
-        log::info!("\tTrying {}", name);
+        log::debug!("\tTrying {}", name);
 
         attributes.clear();
         for &(_, tier_attr) in tiers[..=tier_max].iter() {
@@ -215,11 +273,12 @@ fn choose_config(
                     log::warn!("EGL says it can present to the window but not natively",);
                 }
                 // Android emulator can't natively present either.
-                let tier_threshold = if cfg!(target_os = "android") || cfg!(windows) {
-                    1
-                } else {
-                    2
-                };
+                let tier_threshold =
+                    if cfg!(target_os = "android") || cfg!(windows) || cfg!(target_env = "ohos") {
+                        1
+                    } else {
+                        2
+                    };
                 return Ok((config, tier_max >= tier_threshold));
             }
             Ok(None) => {
@@ -231,56 +290,10 @@ fn choose_config(
         }
     }
 
-    Err(crate::InstanceError)
-}
-
-fn gl_debug_message_callback(source: u32, gltype: u32, id: u32, severity: u32, message: &str) {
-    let source_str = match source {
-        glow::DEBUG_SOURCE_API => "API",
-        glow::DEBUG_SOURCE_WINDOW_SYSTEM => "Window System",
-        glow::DEBUG_SOURCE_SHADER_COMPILER => "ShaderCompiler",
-        glow::DEBUG_SOURCE_THIRD_PARTY => "Third Party",
-        glow::DEBUG_SOURCE_APPLICATION => "Application",
-        glow::DEBUG_SOURCE_OTHER => "Other",
-        _ => unreachable!(),
-    };
-
-    let log_severity = match severity {
-        glow::DEBUG_SEVERITY_HIGH => log::Level::Error,
-        glow::DEBUG_SEVERITY_MEDIUM => log::Level::Warn,
-        glow::DEBUG_SEVERITY_LOW => log::Level::Info,
-        glow::DEBUG_SEVERITY_NOTIFICATION => log::Level::Trace,
-        _ => unreachable!(),
-    };
-
-    let type_str = match gltype {
-        glow::DEBUG_TYPE_DEPRECATED_BEHAVIOR => "Deprecated Behavior",
-        glow::DEBUG_TYPE_ERROR => "Error",
-        glow::DEBUG_TYPE_MARKER => "Marker",
-        glow::DEBUG_TYPE_OTHER => "Other",
-        glow::DEBUG_TYPE_PERFORMANCE => "Performance",
-        glow::DEBUG_TYPE_POP_GROUP => "Pop Group",
-        glow::DEBUG_TYPE_PORTABILITY => "Portability",
-        glow::DEBUG_TYPE_PUSH_GROUP => "Push Group",
-        glow::DEBUG_TYPE_UNDEFINED_BEHAVIOR => "Undefined Behavior",
-        _ => unreachable!(),
-    };
-
-    let _ = std::panic::catch_unwind(|| {
-        log::log!(
-            log_severity,
-            "GLES: [{}/{}] ID {} : {}",
-            source_str,
-            type_str,
-            id,
-            message
-        );
-    });
-
-    if cfg!(debug_assertions) && log_severity == log::Level::Error {
-        // Set canary and continue
-        crate::VALIDATION_CANARY.set();
-    }
+    // TODO: include diagnostic details that are currently logged
+    Err(crate::InstanceError::new(String::from(
+        "unable to find an acceptable EGL framebuffer configuration",
+    )))
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +311,7 @@ impl EglContext {
             .make_current(self.display, self.pbuffer, self.pbuffer, Some(self.raw))
             .unwrap();
     }
+
     fn unmake_current(&self) {
         self.instance
             .make_current(self.display, None, None, None)
@@ -308,7 +322,7 @@ impl EglContext {
 /// A wrapper around a [`glow::Context`] and the required EGL context that uses locking to guarantee
 /// exclusive access when shared with multiple threads.
 pub struct AdapterContext {
-    glow: Mutex<glow::Context>,
+    glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
 }
 
@@ -349,14 +363,39 @@ impl AdapterContext {
     }
 }
 
+impl Drop for AdapterContext {
+    fn drop(&mut self) {
+        struct CurrentGuard<'a>(&'a EglContext);
+        impl Drop for CurrentGuard<'_> {
+            fn drop(&mut self) {
+                self.0.unmake_current();
+            }
+        }
+
+        // Context must be current when dropped. See safety docs on
+        // `glow::HasContext`.
+        //
+        // NOTE: This is only set to `None` by `Adapter::new_external` which
+        // requires the context to be current when anything that may be holding
+        // the `Arc<AdapterShared>` is dropped.
+        let _guard = self.egl.as_ref().map(|egl| {
+            egl.make_current();
+            CurrentGuard(egl)
+        });
+        let glow = self.glow.get_mut();
+        // SAFETY: Field not used after this.
+        unsafe { ManuallyDrop::drop(glow) };
+    }
+}
+
 struct EglContextLock<'a> {
     instance: &'a Arc<EglInstance>,
     display: khronos_egl::Display,
 }
 
-/// A guard containing a lock to an [`AdapterContext`]
+/// A guard containing a lock to an [`AdapterContext`], while the GL context is kept current.
 pub struct AdapterContextLock<'a> {
-    glow: MutexGuard<'a, glow::Context>,
+    glow: MutexGuard<'a, ManuallyDrop<glow::Context>>,
     egl: Option<EglContextLock<'a>>,
 }
 
@@ -390,10 +429,12 @@ impl AdapterContext {
     ///
     /// > **Note:** Calling this function **will** still lock the [`glow::Context`] which adds an
     /// > extra safe-guard against accidental concurrent access to the context.
-    pub unsafe fn get_without_egl_lock(&self) -> MutexGuard<glow::Context> {
-        self.glow
+    pub unsafe fn get_without_egl_lock(&self) -> MappedMutexGuard<glow::Context> {
+        let guard = self
+            .glow
             .try_lock_for(Duration::from_secs(CONTEXT_LOCK_TIMEOUT_SECS))
-            .expect("Could not lock adapter context. This is most-likely a deadlock.")
+            .expect("Could not lock adapter context. This is most-likely a deadlock.");
+        MutexGuard::map(guard, |glow| &mut **glow)
     }
 
     /// Obtain a lock to the EGL context and get handle to the [`glow::Context`] that can be used to
@@ -428,19 +469,67 @@ struct Inner {
     version: (i32, i32),
     supports_native_window: bool,
     config: khronos_egl::Config,
-    #[cfg_attr(target_os = "emscripten", allow(dead_code))]
+    #[cfg_attr(Emscripten, allow(dead_code))]
     wl_display: Option<*mut raw::c_void>,
+    #[cfg_attr(Emscripten, allow(dead_code))]
+    force_gles_minor_version: wgt::Gles3MinorVersion,
     /// Method by which the framebuffer should support srgb
     srgb_kind: SrgbFrameBufferKind,
 }
 
+// Different calls to `eglGetPlatformDisplay` may return the same `Display`, making it a global
+// state of all our `EglContext`s. This forces us to track the number of such context to prevent
+// terminating the display if it's currently used by another `EglContext`.
+static DISPLAYS_REFERENCE_COUNT: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(Default::default);
+
+fn initialize_display(
+    egl: &EglInstance,
+    display: khronos_egl::Display,
+) -> Result<(i32, i32), khronos_egl::Error> {
+    let mut guard = DISPLAYS_REFERENCE_COUNT.lock();
+    *guard.entry(display.as_ptr() as usize).or_default() += 1;
+
+    // We don't need to check the reference count here since according to the `eglInitialize`
+    // documentation, initializing an already initialized EGL display connection has no effect
+    // besides returning the version numbers.
+    egl.initialize(display)
+}
+
+fn terminate_display(
+    egl: &EglInstance,
+    display: khronos_egl::Display,
+) -> Result<(), khronos_egl::Error> {
+    let key = &(display.as_ptr() as usize);
+    let mut guard = DISPLAYS_REFERENCE_COUNT.lock();
+    let count_ref = guard
+        .get_mut(key)
+        .expect("Attempted to decref a display before incref was called");
+
+    if *count_ref > 1 {
+        *count_ref -= 1;
+
+        Ok(())
+    } else {
+        guard.remove(key);
+
+        egl.terminate(display)
+    }
+}
+
 impl Inner {
     fn create(
-        flags: crate::InstanceFlags,
+        flags: wgt::InstanceFlags,
         egl: Arc<EglInstance>,
         display: khronos_egl::Display,
+        force_gles_minor_version: wgt::Gles3MinorVersion,
     ) -> Result<Self, crate::InstanceError> {
-        let version = egl.initialize(display).map_err(|_| crate::InstanceError)?;
+        let version = initialize_display(&egl, display).map_err(|e| {
+            crate::InstanceError::with_source(
+                String::from("failed to initialize EGL display connection"),
+                e,
+            )
+        })?;
         let vendor = egl
             .query_string(Some(display), khronos_egl::VENDOR)
             .unwrap();
@@ -448,17 +537,17 @@ impl Inner {
             .query_string(Some(display), khronos_egl::EXTENSIONS)
             .unwrap()
             .to_string_lossy();
-        log::info!("Display vendor {:?}, version {:?}", vendor, version,);
+        log::debug!("Display vendor {:?}, version {:?}", vendor, version,);
         log::debug!(
             "Display extensions: {:#?}",
             display_extensions.split_whitespace().collect::<Vec<_>>()
         );
 
         let srgb_kind = if version >= (1, 5) {
-            log::info!("\tEGL surface: +srgb");
+            log::debug!("\tEGL surface: +srgb");
             SrgbFrameBufferKind::Core
         } else if display_extensions.contains("EGL_KHR_gl_colorspace") {
-            log::info!("\tEGL surface: +srgb khr");
+            log::debug!("\tEGL surface: +srgb khr");
             SrgbFrameBufferKind::Khr
         } else {
             log::warn!("\tEGL surface: -srgb");
@@ -482,27 +571,60 @@ impl Inner {
         }
 
         let (config, supports_native_window) = choose_config(&egl, display, srgb_kind)?;
-        egl.bind_api(khronos_egl::OPENGL_ES_API).unwrap();
+
+        let supports_opengl = if version >= (1, 4) {
+            let client_apis = egl
+                .query_string(Some(display), khronos_egl::CLIENT_APIS)
+                .unwrap()
+                .to_string_lossy();
+            client_apis
+                .split(' ')
+                .any(|client_api| client_api == "OpenGL")
+        } else {
+            false
+        };
+        egl.bind_api(if supports_opengl {
+            khronos_egl::OPENGL_API
+        } else {
+            khronos_egl::OPENGL_ES_API
+        })
+        .unwrap();
 
         let needs_robustness = true;
         let mut khr_context_flags = 0;
         let supports_khr_context = display_extensions.contains("EGL_KHR_create_context");
 
-        //TODO: make it so `Device` == EGL Context
-        let mut context_attributes = vec![
-            khronos_egl::CONTEXT_CLIENT_VERSION,
-            3, // Request GLES 3.0 or higher
-        ];
-        if flags.contains(crate::InstanceFlags::DEBUG) {
+        let mut context_attributes = vec![];
+        let mut gl_context_attributes = vec![];
+        let mut gles_context_attributes = vec![];
+        gl_context_attributes.push(khronos_egl::CONTEXT_MAJOR_VERSION);
+        gl_context_attributes.push(3);
+        gl_context_attributes.push(khronos_egl::CONTEXT_MINOR_VERSION);
+        gl_context_attributes.push(3);
+        if supports_opengl && force_gles_minor_version != wgt::Gles3MinorVersion::Automatic {
+            log::warn!("Ignoring specified GLES minor version as OpenGL is used");
+        }
+        gles_context_attributes.push(khronos_egl::CONTEXT_MAJOR_VERSION);
+        gles_context_attributes.push(3); // Request GLES 3.0 or higher
+        if force_gles_minor_version != wgt::Gles3MinorVersion::Automatic {
+            gles_context_attributes.push(khronos_egl::CONTEXT_MINOR_VERSION);
+            gles_context_attributes.push(match force_gles_minor_version {
+                wgt::Gles3MinorVersion::Automatic => unreachable!(),
+                wgt::Gles3MinorVersion::Version0 => 0,
+                wgt::Gles3MinorVersion::Version1 => 1,
+                wgt::Gles3MinorVersion::Version2 => 2,
+            });
+        }
+        if flags.contains(wgt::InstanceFlags::DEBUG) {
             if version >= (1, 5) {
-                log::info!("\tEGL context: +debug");
+                log::debug!("\tEGL context: +debug");
                 context_attributes.push(khronos_egl::CONTEXT_OPENGL_DEBUG);
                 context_attributes.push(khronos_egl::TRUE as _);
             } else if supports_khr_context {
-                log::info!("\tEGL context: +debug KHR");
+                log::debug!("\tEGL context: +debug KHR");
                 khr_context_flags |= EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR;
             } else {
-                log::info!("\tEGL context: -debug");
+                log::debug!("\tEGL context: -debug");
             }
         }
         if needs_robustness {
@@ -510,11 +632,11 @@ impl Inner {
             // (regardless of whether the extension is supported!).
             // In fact, Angle does precisely that awful behavior, so we don't try it there.
             if version >= (1, 5) && !display_extensions.contains("EGL_ANGLE_") {
-                log::info!("\tEGL context: +robust access");
+                log::debug!("\tEGL context: +robust access");
                 context_attributes.push(khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS);
                 context_attributes.push(khronos_egl::TRUE as _);
             } else if display_extensions.contains("EGL_EXT_create_context_robustness") {
-                log::info!("\tEGL context: +robust access EXT");
+                log::debug!("\tEGL context: +robust access EXT");
                 context_attributes.push(EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT);
                 context_attributes.push(khronos_egl::TRUE as _);
             } else {
@@ -522,29 +644,45 @@ impl Inner {
                 // because it's for desktop GL only, not GLES.
                 log::warn!("\tEGL context: -robust access");
             }
-
-            //TODO do we need `khronos_egl::CONTEXT_OPENGL_NOTIFICATION_STRATEGY_EXT`?
         }
         if khr_context_flags != 0 {
             context_attributes.push(EGL_CONTEXT_FLAGS_KHR);
             context_attributes.push(khr_context_flags);
         }
         context_attributes.push(khronos_egl::NONE);
-        let context = match egl.create_context(display, config, None, &context_attributes) {
-            Ok(context) => context,
-            Err(e) => {
-                log::warn!("unable to create GLES 3.x context: {:?}", e);
-                return Err(crate::InstanceError);
-            }
-        };
+
+        gl_context_attributes.extend(&context_attributes);
+        gles_context_attributes.extend(&context_attributes);
+
+        let context = if supports_opengl {
+            egl.create_context(display, config, None, &gl_context_attributes)
+                .or_else(|_| {
+                    egl.bind_api(khronos_egl::OPENGL_ES_API).unwrap();
+                    egl.create_context(display, config, None, &gles_context_attributes)
+                })
+                .map_err(|e| {
+                    crate::InstanceError::with_source(
+                        String::from("unable to create OpenGL or GLES 3.x context"),
+                        e,
+                    )
+                })
+        } else {
+            egl.create_context(display, config, None, &gles_context_attributes)
+                .map_err(|e| {
+                    crate::InstanceError::with_source(
+                        String::from("unable to create GLES 3.x context"),
+                        e,
+                    )
+                })
+        }?;
 
         // Testing if context can be binded without surface
         // and creating dummy pbuffer surface if not.
         let pbuffer = if version >= (1, 5)
             || display_extensions.contains("EGL_KHR_surfaceless_context")
-            || cfg!(target_os = "emscripten")
+            || cfg!(Emscripten)
         {
-            log::info!("\tEGL context: +surfaceless");
+            log::debug!("\tEGL context: +surfaceless");
             None
         } else {
             let attributes = [
@@ -557,8 +695,10 @@ impl Inner {
             egl.create_pbuffer_surface(display, config, &attributes)
                 .map(Some)
                 .map_err(|e| {
-                    log::warn!("Error in create_pbuffer_surface: {:?}", e);
-                    crate::InstanceError
+                    crate::InstanceError::with_source(
+                        String::from("error in create_pbuffer_surface"),
+                        e,
+                    )
                 })?
         };
 
@@ -575,6 +715,7 @@ impl Inner {
             config,
             wl_display: None,
             srgb_kind,
+            force_gles_minor_version,
         })
     }
 }
@@ -588,7 +729,8 @@ impl Drop for Inner {
         {
             log::warn!("Error in destroy_context: {:?}", e);
         }
-        if let Err(e) = self.egl.instance.terminate(self.egl.display) {
+
+        if let Err(e) = terminate_display(&self.egl.instance, self.egl.display) {
             log::warn!("Error in terminate: {:?}", e);
         }
     }
@@ -604,13 +746,14 @@ enum WindowKind {
 
 #[derive(Clone, Debug)]
 struct WindowSystemInterface {
-    library: Option<Arc<libloading::Library>>,
+    display_owner: Option<Rc<DisplayOwner>>,
     kind: WindowKind,
 }
 
 pub struct Instance {
     wsi: WindowSystemInterface,
-    flags: crate::InstanceFlags,
+    flags: wgt::InstanceFlags,
+    options: wgt::GlBackendOptions,
     inner: Mutex<Inner>,
 }
 
@@ -630,25 +773,35 @@ impl Instance {
             .expect("Could not lock instance. This is most-likely a deadlock.")
             .version
     }
+
+    pub fn egl_config(&self) -> khronos_egl::Config {
+        self.inner
+            .try_lock()
+            .expect("Could not lock instance. This is most-likely a deadlock.")
+            .config
+    }
 }
 
 unsafe impl Send for Instance {}
 unsafe impl Sync for Instance {}
 
-impl crate::Instance<super::Api> for Instance {
+impl crate::Instance for Instance {
+    type A = super::Api;
+
     unsafe fn init(desc: &crate::InstanceDescriptor) -> Result<Self, crate::InstanceError> {
-        #[cfg(target_os = "emscripten")]
+        profiling::scope!("Init OpenGL (EGL) Backend");
+        #[cfg(Emscripten)]
         let egl_result: Result<EglInstance, khronos_egl::Error> =
             Ok(khronos_egl::Instance::new(khronos_egl::Static));
 
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(not(Emscripten))]
         let egl_result = if cfg!(windows) {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
                     "libEGL.dll",
                 )
             }
-        } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+        } else if cfg!(target_vendor = "apple") {
             unsafe {
                 khronos_egl::DynamicInstance::<khronos_egl::EGL1_4>::load_required_from_filename(
                     "libEGL.dylib",
@@ -660,8 +813,10 @@ impl crate::Instance<super::Api> for Instance {
         let egl = match egl_result {
             Ok(egl) => Arc::new(egl),
             Err(e) => {
-                log::info!("Unable to open libEGL: {:?}", e);
-                return Err(crate::InstanceError);
+                return Err(crate::InstanceError::with_source(
+                    String::from("unable to open libEGL"),
+                    e,
+                ));
             }
         };
 
@@ -692,70 +847,79 @@ impl crate::Instance<super::Api> for Instance {
             None
         };
 
-        #[cfg(not(target_os = "emscripten"))]
+        #[cfg(not(Emscripten))]
         let egl1_5 = egl.upcast::<khronos_egl::EGL1_5>();
 
-        #[cfg(target_os = "emscripten")]
+        #[cfg(Emscripten)]
         let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
-        let (display, wsi_library, wsi_kind) = if let (Some(library), Some(egl)) =
-            (wayland_library, egl1_5)
-        {
-            log::info!("Using Wayland platform");
-            let display_attributes = [khronos_egl::ATTRIB_NONE];
-            let display = egl
-                .get_platform_display(
-                    EGL_PLATFORM_WAYLAND_KHR,
-                    khronos_egl::DEFAULT_DISPLAY,
-                    &display_attributes,
-                )
+        let (display, display_owner, wsi_kind) =
+            if let (Some(library), Some(egl)) = (wayland_library, egl1_5) {
+                log::info!("Using Wayland platform");
+                let display_attributes = [khronos_egl::ATTRIB_NONE];
+                let display = unsafe {
+                    egl.get_platform_display(
+                        EGL_PLATFORM_WAYLAND_KHR,
+                        khronos_egl::DEFAULT_DISPLAY,
+                        &display_attributes,
+                    )
+                }
                 .unwrap();
-            (display, Some(Arc::new(library)), WindowKind::Wayland)
-        } else if let (Some((display, library)), Some(egl)) = (x11_display_library, egl1_5) {
-            log::info!("Using X11 platform");
-            let display_attributes = [khronos_egl::ATTRIB_NONE];
-            let display = egl
-                .get_platform_display(EGL_PLATFORM_X11_KHR, display.as_ptr(), &display_attributes)
+                (display, Some(Rc::new(library)), WindowKind::Wayland)
+            } else if let (Some(display_owner), Some(egl)) = (x11_display_library, egl1_5) {
+                log::info!("Using X11 platform");
+                let display_attributes = [khronos_egl::ATTRIB_NONE];
+                let display = unsafe {
+                    egl.get_platform_display(
+                        EGL_PLATFORM_X11_KHR,
+                        display_owner.display.as_ptr(),
+                        &display_attributes,
+                    )
+                }
                 .unwrap();
-            (display, Some(Arc::new(library)), WindowKind::X11)
-        } else if let (Some((display, library)), Some(egl)) = (angle_x11_display_library, egl1_5) {
-            log::info!("Using Angle platform with X11");
-            let display_attributes = [
-                EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE as khronos_egl::Attrib,
-                EGL_PLATFORM_X11_KHR as khronos_egl::Attrib,
-                EGL_PLATFORM_ANGLE_DEBUG_LAYERS_ENABLED as khronos_egl::Attrib,
-                usize::from(desc.flags.contains(crate::InstanceFlags::VALIDATION)),
-                khronos_egl::ATTRIB_NONE,
-            ];
-            let display = egl
-                .get_platform_display(
-                    EGL_PLATFORM_ANGLE_ANGLE,
-                    display.as_ptr(),
-                    &display_attributes,
-                )
+                (display, Some(Rc::new(display_owner)), WindowKind::X11)
+            } else if let (Some(display_owner), Some(egl)) = (angle_x11_display_library, egl1_5) {
+                log::info!("Using Angle platform with X11");
+                let display_attributes = [
+                    EGL_PLATFORM_ANGLE_NATIVE_PLATFORM_TYPE_ANGLE as khronos_egl::Attrib,
+                    EGL_PLATFORM_X11_KHR as khronos_egl::Attrib,
+                    EGL_PLATFORM_ANGLE_DEBUG_LAYERS_ENABLED as khronos_egl::Attrib,
+                    usize::from(desc.flags.contains(wgt::InstanceFlags::VALIDATION)),
+                    khronos_egl::ATTRIB_NONE,
+                ];
+                let display = unsafe {
+                    egl.get_platform_display(
+                        EGL_PLATFORM_ANGLE_ANGLE,
+                        display_owner.display.as_ptr(),
+                        &display_attributes,
+                    )
+                }
                 .unwrap();
-            (display, Some(Arc::new(library)), WindowKind::AngleX11)
-        } else if client_ext_str.contains("EGL_MESA_platform_surfaceless") {
-            log::info!("No windowing system present. Using surfaceless platform");
-            let egl = egl1_5.expect("Failed to get EGL 1.5 for surfaceless");
-            let display = egl
-                .get_platform_display(
-                    EGL_PLATFORM_SURFACELESS_MESA,
-                    std::ptr::null_mut(),
-                    &[khronos_egl::ATTRIB_NONE],
-                )
+                (display, Some(Rc::new(display_owner)), WindowKind::AngleX11)
+            } else if client_ext_str.contains("EGL_MESA_platform_surfaceless") {
+                log::warn!("No windowing system present. Using surfaceless platform");
+                #[allow(clippy::unnecessary_literal_unwrap)] // This is only a literal on Emscripten
+                let egl = egl1_5.expect("Failed to get EGL 1.5 for surfaceless");
+                let display = unsafe {
+                    egl.get_platform_display(
+                        EGL_PLATFORM_SURFACELESS_MESA,
+                        khronos_egl::DEFAULT_DISPLAY,
+                        &[khronos_egl::ATTRIB_NONE],
+                    )
+                }
                 .unwrap();
-            (display, None, WindowKind::Unknown)
-        } else {
-            log::info!("EGL_MESA_platform_surfaceless not available. Using default platform");
-            let display = egl.get_display(khronos_egl::DEFAULT_DISPLAY).unwrap();
-            (display, None, WindowKind::Unknown)
-        };
 
-        if desc.flags.contains(crate::InstanceFlags::VALIDATION)
+                (display, None, WindowKind::Unknown)
+            } else {
+                log::warn!("EGL_MESA_platform_surfaceless not available. Using default platform");
+                let display = unsafe { egl.get_display(khronos_egl::DEFAULT_DISPLAY) }.unwrap();
+                (display, None, WindowKind::Unknown)
+            };
+
+        if desc.flags.contains(wgt::InstanceFlags::VALIDATION)
             && client_ext_str.contains("EGL_KHR_debug")
         {
-            log::info!("Enabling EGL debug output");
+            log::debug!("Enabling EGL debug output");
             let function: EglDebugMessageControlFun = {
                 let addr = egl.get_proc_address("eglDebugMessageControlKHR").unwrap();
                 unsafe { std::mem::transmute(addr) }
@@ -774,14 +938,20 @@ impl crate::Instance<super::Api> for Instance {
             unsafe { (function)(Some(egl_debug_proc), attributes.as_ptr()) };
         }
 
-        let inner = Inner::create(desc.flags, egl, display)?;
+        let inner = Inner::create(
+            desc.flags,
+            egl,
+            display,
+            desc.backend_options.gl.gles_minor_version,
+        )?;
 
         Ok(Instance {
             wsi: WindowSystemInterface {
-                library: wsi_library,
+                display_owner,
                 kind: wsi_kind,
             },
             flags: desc.flags,
+            options: desc.backend_options.gl.clone(),
             inner: Mutex::new(inner),
         })
     }
@@ -794,10 +964,7 @@ impl crate::Instance<super::Api> for Instance {
     ) -> Result<Surface, crate::InstanceError> {
         use raw_window_handle::RawWindowHandle as Rwh;
 
-        #[cfg_attr(
-            any(target_os = "android", target_os = "emscripten"),
-            allow(unused_mut)
-        )]
+        #[cfg_attr(any(target_os = "android", Emscripten), allow(unused_mut))]
         let mut inner = self.inner.lock();
 
         match (window_handle, display_handle) {
@@ -805,6 +972,7 @@ impl crate::Instance<super::Api> for Instance {
             (Rwh::Xcb(_), _) => {}
             (Rwh::Win32(_), _) => {}
             (Rwh::AppKit(_), _) => {}
+            (Rwh::OhosNdk(_), _) => {}
             #[cfg(target_os = "android")]
             (Rwh::AndroidNdk(handle), _) => {
                 let format = inner
@@ -818,19 +986,28 @@ impl crate::Instance<super::Api> for Instance {
                     .unwrap();
 
                 let ret = unsafe {
-                    ANativeWindow_setBuffersGeometry(handle.a_native_window, 0, 0, format)
+                    ndk_sys::ANativeWindow_setBuffersGeometry(
+                        handle
+                            .a_native_window
+                            .as_ptr()
+                            .cast::<ndk_sys::ANativeWindow>(),
+                        0,
+                        0,
+                        format,
+                    )
                 };
 
                 if ret != 0 {
-                    log::error!("Error returned from ANativeWindow_setBuffersGeometry");
-                    return Err(crate::InstanceError);
+                    return Err(crate::InstanceError::new(format!(
+                        "error {ret} returned from ANativeWindow_setBuffersGeometry",
+                    )));
                 }
             }
-            #[cfg(not(target_os = "emscripten"))]
+            #[cfg(not(Emscripten))]
             (Rwh::Wayland(_), raw_window_handle::RawDisplayHandle::Wayland(display_handle)) => {
                 if inner
                     .wl_display
-                    .map(|ptr| ptr != display_handle.display)
+                    .map(|ptr| ptr != display_handle.display.as_ptr())
                     .unwrap_or(true)
                 {
                     /* Wayland displays are not sharable between surfaces so if the
@@ -844,33 +1021,39 @@ impl crate::Instance<super::Api> for Instance {
                     use std::ops::DerefMut;
                     let display_attributes = [khronos_egl::ATTRIB_NONE];
 
-                    let display = inner
-                        .egl
-                        .instance
-                        .upcast::<khronos_egl::EGL1_5>()
-                        .unwrap()
-                        .get_platform_display(
-                            EGL_PLATFORM_WAYLAND_KHR,
-                            display_handle.display,
-                            &display_attributes,
-                        )
-                        .unwrap();
+                    let display = unsafe {
+                        inner
+                            .egl
+                            .instance
+                            .upcast::<khronos_egl::EGL1_5>()
+                            .unwrap()
+                            .get_platform_display(
+                                EGL_PLATFORM_WAYLAND_KHR,
+                                display_handle.display.as_ptr(),
+                                &display_attributes,
+                            )
+                    }
+                    .unwrap();
 
-                    let new_inner =
-                        Inner::create(self.flags, Arc::clone(&inner.egl.instance), display)
-                            .map_err(|_| crate::InstanceError)?;
+                    let new_inner = Inner::create(
+                        self.flags,
+                        Arc::clone(&inner.egl.instance),
+                        display,
+                        inner.force_gles_minor_version,
+                    )?;
 
                     let old_inner = std::mem::replace(inner.deref_mut(), new_inner);
-                    inner.wl_display = Some(display_handle.display);
+                    inner.wl_display = Some(display_handle.display.as_ptr());
 
                     drop(old_inner);
                 }
             }
-            #[cfg(target_os = "emscripten")]
+            #[cfg(Emscripten)]
             (Rwh::Web(_), _) => {}
             other => {
-                log::error!("Unsupported window: {:?}", other);
-                return Err(crate::InstanceError);
+                return Err(crate::InstanceError::new(format!(
+                    "unsupported window: {other:?}"
+                )));
             }
         };
 
@@ -882,17 +1065,19 @@ impl crate::Instance<super::Api> for Instance {
             config: inner.config,
             presentable: inner.supports_native_window,
             raw_window_handle: window_handle,
-            swapchain: None,
+            swapchain: RwLock::new(None),
             srgb_kind: inner.srgb_kind,
         })
     }
-    unsafe fn destroy_surface(&self, _surface: Surface) {}
 
-    unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<super::Api>> {
+    unsafe fn enumerate_adapters(
+        &self,
+        _surface_hint: Option<&Surface>,
+    ) -> Vec<crate::ExposedAdapter<super::Api>> {
         let inner = self.inner.lock();
         inner.egl.make_current();
 
-        let gl = unsafe {
+        let mut gl = unsafe {
             glow::Context::from_loader_function(|name| {
                 inner
                     .egl
@@ -902,25 +1087,38 @@ impl crate::Instance<super::Api> for Instance {
             })
         };
 
-        if self.flags.contains(crate::InstanceFlags::DEBUG) && gl.supports_debug() {
-            log::info!("Max label length: {}", unsafe {
+        // In contrast to OpenGL ES, OpenGL requires explicitly enabling sRGB conversions,
+        // as otherwise the user has to do the sRGB conversion.
+        if !matches!(inner.srgb_kind, SrgbFrameBufferKind::None) {
+            unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
+        }
+
+        if self.flags.contains(wgt::InstanceFlags::DEBUG) && gl.supports_debug() {
+            log::debug!("Max label length: {}", unsafe {
                 gl.get_parameter_i32(glow::MAX_LABEL_LENGTH)
             });
         }
 
-        if self.flags.contains(crate::InstanceFlags::VALIDATION) && gl.supports_debug() {
-            log::info!("Enabling GLES debug output");
+        if self.flags.contains(wgt::InstanceFlags::VALIDATION) && gl.supports_debug() {
+            log::debug!("Enabling GLES debug output");
             unsafe { gl.enable(glow::DEBUG_OUTPUT) };
-            unsafe { gl.debug_message_callback(gl_debug_message_callback) };
+            unsafe { gl.debug_message_callback(super::gl_debug_message_callback) };
         }
 
+        // Wrap in ManuallyDrop to make it easier to "current" the GL context before dropping this
+        // GLOW context, which could also happen if a panic occurs after we uncurrent the context
+        // below but before AdapterContext is constructed.
+        let gl = ManuallyDrop::new(gl);
         inner.egl.unmake_current();
 
         unsafe {
-            super::Adapter::expose(AdapterContext {
-                glow: Mutex::new(gl),
-                egl: Some(inner.egl.clone()),
-            })
+            super::Adapter::expose(
+                AdapterContext {
+                    glow: Mutex::new(gl),
+                    egl: Some(inner.egl.clone()),
+                },
+                self.options.clone(),
+            )
         }
         .into_iter()
         .collect()
@@ -935,15 +1133,21 @@ impl super::Adapter {
     /// - The underlying OpenGL ES context must be current.
     /// - The underlying OpenGL ES context must be current when interfacing with any objects returned by
     ///   wgpu-hal from this adapter.
+    /// - The underlying OpenGL ES context must be current when dropping this adapter and when
+    ///   dropping any objects returned from this adapter.
     pub unsafe fn new_external(
         fun: impl FnMut(&str) -> *const ffi::c_void,
+        options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
         let context = unsafe { glow::Context::from_loader_function(fun) };
         unsafe {
-            Self::expose(AdapterContext {
-                glow: Mutex::new(context),
-                egl: None,
-            })
+            Self::expose(
+                AdapterContext {
+                    glow: Mutex::new(ManuallyDrop::new(context)),
+                    egl: None,
+                },
+                options,
+            )
         }
     }
 
@@ -980,7 +1184,7 @@ pub struct Surface {
     config: khronos_egl::Config,
     pub(super) presentable: bool,
     raw_window_handle: raw_window_handle::RawWindowHandle,
-    swapchain: Option<Swapchain>,
+    swapchain: RwLock<Option<Swapchain>>,
     srgb_kind: SrgbFrameBufferKind,
 }
 
@@ -989,11 +1193,13 @@ unsafe impl Sync for Surface {}
 
 impl Surface {
     pub(super) unsafe fn present(
-        &mut self,
+        &self,
         _suf_texture: super::Texture,
-        gl: &glow::Context,
+        context: &AdapterContext,
     ) -> Result<(), crate::SurfaceError> {
-        let sc = self.swapchain.as_ref().unwrap();
+        let gl = unsafe { context.get_without_egl_lock() };
+        let swapchain = self.swapchain.read();
+        let sc = swapchain.as_ref().unwrap();
 
         self.egl
             .instance
@@ -1013,6 +1219,13 @@ impl Surface {
 
         unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(sc.framebuffer)) };
+
+        if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
+            // Disable sRGB conversions for `glBlitFramebuffer` as behavior does diverge between
+            // drivers and formats otherwise and we want to ensure no sRGB conversions happen.
+            unsafe { gl.disable(glow::FRAMEBUFFER_SRGB) };
+        }
+
         // Note the Y-flipping here. GL's presentation is not flipped,
         // but main rendering is. Therefore, we Y-flip the output positions
         // in the shader, and also this blit.
@@ -1030,6 +1243,11 @@ impl Surface {
                 glow::NEAREST,
             )
         };
+
+        if !matches!(self.srgb_kind, SrgbFrameBufferKind::None) {
+            unsafe { gl.enable(glow::FRAMEBUFFER_SRGB) };
+        }
+
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
         self.egl
@@ -1038,6 +1256,7 @@ impl Surface {
             .map_err(|e| {
                 log::error!("swap_buffers failed: {}", e);
                 crate::SurfaceError::Lost
+                // TODO: should we unset the current context here?
             })?;
         self.egl
             .instance
@@ -1051,11 +1270,11 @@ impl Surface {
     }
 
     unsafe fn unconfigure_impl(
-        &mut self,
+        &self,
         device: &super::Device,
     ) -> Option<(khronos_egl::Surface, Option<*mut raw::c_void>)> {
         let gl = &device.shared.context.lock();
-        match self.swapchain.take() {
+        match self.swapchain.write().take() {
             Some(sc) => {
                 unsafe { gl.delete_renderbuffer(sc.renderbuffer) };
                 unsafe { gl.delete_framebuffer(sc.framebuffer) };
@@ -1073,9 +1292,11 @@ impl Surface {
     }
 }
 
-impl crate::Surface<super::Api> for Surface {
+impl crate::Surface for Surface {
+    type A = super::Api;
+
     unsafe fn configure(
-        &mut self,
+        &self,
         device: &super::Device,
         config: &crate::SurfaceConfiguration,
     ) -> Result<(), crate::SurfaceError> {
@@ -1086,45 +1307,48 @@ impl crate::Surface<super::Api> for Surface {
             None => {
                 let mut wl_window = None;
                 let (mut temp_xlib_handle, mut temp_xcb_handle);
-                #[allow(trivial_casts)]
                 let native_window_ptr = match (self.wsi.kind, self.raw_window_handle) {
                     (WindowKind::Unknown | WindowKind::X11, Rwh::Xlib(handle)) => {
                         temp_xlib_handle = handle.window;
-                        &mut temp_xlib_handle as *mut _ as *mut std::ffi::c_void
+                        ptr::from_mut(&mut temp_xlib_handle).cast::<ffi::c_void>()
                     }
-                    (WindowKind::AngleX11, Rwh::Xlib(handle)) => {
-                        handle.window as *mut std::ffi::c_void
-                    }
+                    (WindowKind::AngleX11, Rwh::Xlib(handle)) => handle.window as *mut ffi::c_void,
                     (WindowKind::Unknown | WindowKind::X11, Rwh::Xcb(handle)) => {
                         temp_xcb_handle = handle.window;
-                        &mut temp_xcb_handle as *mut _ as *mut std::ffi::c_void
+                        ptr::from_mut(&mut temp_xcb_handle).cast::<ffi::c_void>()
                     }
                     (WindowKind::AngleX11, Rwh::Xcb(handle)) => {
-                        handle.window as *mut std::ffi::c_void
+                        handle.window.get() as *mut ffi::c_void
                     }
-                    (WindowKind::Unknown, Rwh::AndroidNdk(handle)) => handle.a_native_window,
+                    (WindowKind::Unknown, Rwh::AndroidNdk(handle)) => {
+                        handle.a_native_window.as_ptr()
+                    }
+                    (WindowKind::Unknown, Rwh::OhosNdk(handle)) => handle.native_window.as_ptr(),
                     (WindowKind::Wayland, Rwh::Wayland(handle)) => {
-                        let library = self.wsi.library.as_ref().unwrap();
+                        let library = &self.wsi.display_owner.as_ref().unwrap().library;
                         let wl_egl_window_create: libloading::Symbol<WlEglWindowCreateFun> =
-                            unsafe { library.get(b"wl_egl_window_create") }.unwrap();
-                        let window = unsafe { wl_egl_window_create(handle.surface, 640, 480) }
-                            as *mut _ as *mut std::ffi::c_void;
+                            unsafe { library.get(c"wl_egl_window_create".to_bytes()) }.unwrap();
+                        let window =
+                            unsafe { wl_egl_window_create(handle.surface.as_ptr(), 640, 480) }
+                                .cast();
                         wl_window = Some(window);
                         window
                     }
-                    #[cfg(target_os = "emscripten")]
-                    (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut std::ffi::c_void,
-                    (WindowKind::Unknown, Rwh::Win32(handle)) => handle.hwnd,
+                    #[cfg(Emscripten)]
+                    (WindowKind::Unknown, Rwh::Web(handle)) => handle.id as *mut ffi::c_void,
+                    (WindowKind::Unknown, Rwh::Win32(handle)) => {
+                        handle.hwnd.get() as *mut ffi::c_void
+                    }
                     (WindowKind::Unknown, Rwh::AppKit(handle)) => {
                         #[cfg(not(target_os = "macos"))]
-                        let window_ptr = handle.ns_view;
+                        let window_ptr = handle.ns_view.as_ptr();
                         #[cfg(target_os = "macos")]
                         let window_ptr = {
                             use objc::{msg_send, runtime::Object, sel, sel_impl};
                             // ns_view always have a layer and don't need to verify that it exists.
                             let layer: *mut Object =
-                                msg_send![handle.ns_view as *mut Object, layer];
-                            layer as *mut ffi::c_void
+                                msg_send![handle.ns_view.as_ptr().cast::<Object>(), layer];
+                            layer.cast::<ffi::c_void>()
                         };
                         window_ptr
                     }
@@ -1143,8 +1367,11 @@ impl crate::Surface<super::Api> for Surface {
                     // We don't want any of the buffering done by the driver, because we
                     // manage a swapchain on our side.
                     // Some drivers just fail on surface creation seeing `EGL_SINGLE_BUFFER`.
-                    if cfg!(any(target_os = "android", target_os = "macos"))
-                        || cfg!(windows)
+                    if cfg!(any(
+                        target_os = "android",
+                        target_os = "macos",
+                        target_env = "ohos"
+                    )) || cfg!(windows)
                         || self.wsi.kind == WindowKind::AngleX11
                     {
                         khronos_egl::BACK_BUFFER
@@ -1152,23 +1379,25 @@ impl crate::Surface<super::Api> for Surface {
                         khronos_egl::SINGLE_BUFFER
                     },
                 ];
-                match self.srgb_kind {
-                    SrgbFrameBufferKind::None => {}
-                    SrgbFrameBufferKind::Core => {
-                        attributes.push(khronos_egl::GL_COLORSPACE);
-                        attributes.push(khronos_egl::GL_COLORSPACE_SRGB);
-                    }
-                    SrgbFrameBufferKind::Khr => {
-                        attributes.push(EGL_GL_COLORSPACE_KHR as i32);
-                        attributes.push(EGL_GL_COLORSPACE_SRGB_KHR as i32);
+                if config.format.is_srgb() {
+                    match self.srgb_kind {
+                        SrgbFrameBufferKind::None => {}
+                        SrgbFrameBufferKind::Core => {
+                            attributes.push(khronos_egl::GL_COLORSPACE);
+                            attributes.push(khronos_egl::GL_COLORSPACE_SRGB);
+                        }
+                        SrgbFrameBufferKind::Khr => {
+                            attributes.push(EGL_GL_COLORSPACE_KHR as i32);
+                            attributes.push(EGL_GL_COLORSPACE_SRGB_KHR as i32);
+                        }
                     }
                 }
                 attributes.push(khronos_egl::ATTRIB_NONE as i32);
 
-                #[cfg(not(target_os = "emscripten"))]
+                #[cfg(not(Emscripten))]
                 let egl1_5 = self.egl.instance.upcast::<khronos_egl::EGL1_5>();
 
-                #[cfg(target_os = "emscripten")]
+                #[cfg(Emscripten)]
                 let egl1_5: Option<&Arc<EglInstance>> = Some(&self.egl.instance);
 
                 // Careful, we can still be in 1.4 version even if `upcast` succeeds
@@ -1178,12 +1407,14 @@ impl crate::Surface<super::Api> for Surface {
                             .into_iter()
                             .map(|v| v as usize)
                             .collect::<Vec<_>>();
-                        egl.create_platform_window_surface(
-                            self.egl.display,
-                            self.config,
-                            native_window_ptr,
-                            &attributes_usize,
-                        )
+                        unsafe {
+                            egl.create_platform_window_surface(
+                                self.egl.display,
+                                self.config,
+                                native_window_ptr,
+                                &attributes_usize,
+                            )
+                        }
                     }
                     _ => unsafe {
                         self.egl.instance.create_window_surface(
@@ -1206,9 +1437,9 @@ impl crate::Surface<super::Api> for Surface {
         };
 
         if let Some(window) = wl_window {
-            let library = self.wsi.library.as_ref().unwrap();
+            let library = &self.wsi.display_owner.as_ref().unwrap().library;
             let wl_egl_window_resize: libloading::Symbol<WlEglWindowResizeFun> =
-                unsafe { library.get(b"wl_egl_window_resize") }.unwrap();
+                unsafe { library.get(c"wl_egl_window_resize".to_bytes()) }.unwrap();
             unsafe {
                 wl_egl_window_resize(
                     window,
@@ -1251,7 +1482,8 @@ impl crate::Surface<super::Api> for Surface {
         unsafe { gl.bind_renderbuffer(glow::RENDERBUFFER, None) };
         unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None) };
 
-        self.swapchain = Some(Swapchain {
+        let mut swapchain = self.swapchain.write();
+        *swapchain = Some(Swapchain {
             surface,
             wl_window,
             renderbuffer,
@@ -1265,26 +1497,33 @@ impl crate::Surface<super::Api> for Surface {
         Ok(())
     }
 
-    unsafe fn unconfigure(&mut self, device: &super::Device) {
+    unsafe fn unconfigure(&self, device: &super::Device) {
         if let Some((surface, wl_window)) = unsafe { self.unconfigure_impl(device) } {
             self.egl
                 .instance
                 .destroy_surface(self.egl.display, surface)
                 .unwrap();
             if let Some(window) = wl_window {
-                let library = self.wsi.library.as_ref().expect("unsupported window");
+                let library = &self
+                    .wsi
+                    .display_owner
+                    .as_ref()
+                    .expect("unsupported window")
+                    .library;
                 let wl_egl_window_destroy: libloading::Symbol<WlEglWindowDestroyFun> =
-                    unsafe { library.get(b"wl_egl_window_destroy") }.unwrap();
+                    unsafe { library.get(c"wl_egl_window_destroy".to_bytes()) }.unwrap();
                 unsafe { wl_egl_window_destroy(window) };
             }
         }
     }
 
     unsafe fn acquire_texture(
-        &mut self,
+        &self,
         _timeout_ms: Option<Duration>, //TODO
+        _fence: &super::Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<super::Api>>, crate::SurfaceError> {
-        let sc = self.swapchain.as_ref().unwrap();
+        let swapchain = self.swapchain.read();
+        let sc = swapchain.as_ref().unwrap();
         let texture = super::Texture {
             inner: super::TextureInner::Renderbuffer {
                 raw: sc.renderbuffer,
@@ -1299,12 +1538,11 @@ impl crate::Surface<super::Api> for Surface {
                 height: sc.extent.height,
                 depth: 1,
             },
-            is_cubemap: false,
         };
         Ok(Some(crate::AcquiredSurfaceTexture {
             texture,
             suboptimal: false,
         }))
     }
-    unsafe fn discard_texture(&mut self, _texture: super::Texture) {}
+    unsafe fn discard_texture(&self, _texture: super::Texture) {}
 }

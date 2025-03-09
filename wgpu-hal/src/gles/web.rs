@@ -1,6 +1,8 @@
+use alloc::{format, string::String, vec::Vec};
+
 use glow::HasContext;
-use parking_lot::Mutex;
-use wasm_bindgen::JsCast;
+use parking_lot::{Mutex, RwLock};
+use wasm_bindgen::{JsCast, JsValue};
 
 use super::TextureFormatDesc;
 
@@ -8,6 +10,7 @@ use super::TextureFormatDesc;
 /// with the `AdapterContext` API from the EGL implementation.
 pub struct AdapterContext {
     pub glow_context: glow::Context,
+    pub webgl2_context: web_sys::WebGl2RenderingContext,
 }
 
 impl AdapterContext {
@@ -25,7 +28,7 @@ impl AdapterContext {
 
 #[derive(Debug)]
 pub struct Instance {
-    webgl2_context: Mutex<Option<web_sys::WebGl2RenderingContext>>,
+    options: wgt::GlBackendOptions,
 }
 
 impl Instance {
@@ -54,7 +57,7 @@ impl Instance {
     fn create_surface_from_context(
         &self,
         canvas: Canvas,
-        context_result: Result<Option<js_sys::Object>, wasm_bindgen::JsValue>,
+        context_result: Result<Option<js_sys::Object>, JsValue>,
     ) -> Result<Surface, crate::InstanceError> {
         let context_object: js_sys::Object = match context_result {
             Ok(Some(context)) => context,
@@ -65,14 +68,17 @@ impl Instance {
                 // “not supported” could include “insufficient GPU resources” or “the GPU process
                 // previously crashed”. So, we must return it as an `Err` since it could occur
                 // for circumstances outside the application author's control.
-                return Err(crate::InstanceError);
+                return Err(crate::InstanceError::new(String::from(concat!(
+                    "canvas.getContext() returned null; ",
+                    "webgl2 not available or canvas already in use"
+                ))));
             }
             Err(js_error) => {
                 // <https://html.spec.whatwg.org/multipage/canvas.html#dom-canvas-getcontext>
-                // A thrown exception indicates misuse of the canvas state. Ideally we wouldn't
-                // panic in this case, but for now, `InstanceError` conveys no detail, so it
-                // is more informative to panic with a specific message.
-                panic!("canvas.getContext() threw {js_error:?}")
+                // A thrown exception indicates misuse of the canvas state.
+                return Err(crate::InstanceError::new(format!(
+                    "canvas.getContext() threw exception {js_error:?}",
+                )));
             }
         };
 
@@ -82,51 +88,60 @@ impl Instance {
             .dyn_into()
             .expect("canvas context is not a WebGl2RenderingContext");
 
-        *self.webgl2_context.lock() = Some(webgl2_context.clone());
-
         Ok(Surface {
             canvas,
             webgl2_context,
-            srgb_present_program: None,
-            swapchain: None,
-            texture: None,
+            srgb_present_program: Mutex::new(None),
+            swapchain: RwLock::new(None),
+            texture: Mutex::new(None),
             presentable: true,
         })
     }
 
     fn create_context_options() -> js_sys::Object {
         let context_options = js_sys::Object::new();
-        js_sys::Reflect::set(
-            &context_options,
-            &"antialias".into(),
-            &wasm_bindgen::JsValue::FALSE,
-        )
-        .expect("Cannot create context options");
+        js_sys::Reflect::set(&context_options, &"antialias".into(), &JsValue::FALSE)
+            .expect("Cannot create context options");
         context_options
     }
 }
 
-// SAFE: WASM doesn't have threads
+#[cfg(send_sync)]
 unsafe impl Sync for Instance {}
+#[cfg(send_sync)]
 unsafe impl Send for Instance {}
 
-impl crate::Instance<super::Api> for Instance {
-    unsafe fn init(_desc: &crate::InstanceDescriptor) -> Result<Self, crate::InstanceError> {
+impl crate::Instance for Instance {
+    type A = super::Api;
+
+    unsafe fn init(desc: &crate::InstanceDescriptor) -> Result<Self, crate::InstanceError> {
+        profiling::scope!("Init OpenGL (WebGL) Backend");
         Ok(Instance {
-            webgl2_context: Mutex::new(None),
+            options: desc.backend_options.gl.clone(),
         })
     }
 
-    unsafe fn enumerate_adapters(&self) -> Vec<crate::ExposedAdapter<super::Api>> {
-        let context_guard = self.webgl2_context.lock();
-        let gl = match *context_guard {
-            Some(ref webgl2_context) => glow::Context::from_webgl2_context(webgl2_context.clone()),
-            None => return Vec::new(),
-        };
+    unsafe fn enumerate_adapters(
+        &self,
+        surface_hint: Option<&Surface>,
+    ) -> Vec<crate::ExposedAdapter<super::Api>> {
+        if let Some(surface_hint) = surface_hint {
+            let gl = glow::Context::from_webgl2_context(surface_hint.webgl2_context.clone());
 
-        unsafe { super::Adapter::expose(AdapterContext { glow_context: gl }) }
+            unsafe {
+                super::Adapter::expose(
+                    AdapterContext {
+                        glow_context: gl,
+                        webgl2_context: surface_hint.webgl2_context.clone(),
+                    },
+                    self.options.clone(),
+                )
+            }
             .into_iter()
             .collect()
+        } else {
+            Vec::new()
+        }
     }
 
     unsafe fn create_surface(
@@ -134,52 +149,69 @@ impl crate::Instance<super::Api> for Instance {
         _display_handle: raw_window_handle::RawDisplayHandle,
         window_handle: raw_window_handle::RawWindowHandle,
     ) -> Result<Surface, crate::InstanceError> {
-        if let raw_window_handle::RawWindowHandle::Web(handle) = window_handle {
-            let canvas: web_sys::HtmlCanvasElement = web_sys::window()
+        let canvas: web_sys::HtmlCanvasElement = match window_handle {
+            raw_window_handle::RawWindowHandle::Web(handle) => web_sys::window()
                 .and_then(|win| win.document())
                 .expect("Cannot get document")
                 .query_selector(&format!("canvas[data-raw-handle=\"{}\"]", handle.id))
                 .expect("Cannot query for canvas")
                 .expect("Canvas is not found")
                 .dyn_into()
-                .expect("Failed to downcast to canvas type");
-
-            self.create_surface_from_canvas(canvas)
-        } else {
-            Err(crate::InstanceError)
-        }
-    }
-
-    unsafe fn destroy_surface(&self, surface: Surface) {
-        let mut context_option_ref = self.webgl2_context.lock();
-
-        if let Some(context) = context_option_ref.as_ref() {
-            if context == &surface.webgl2_context {
-                *context_option_ref = None;
+                .expect("Failed to downcast to canvas type"),
+            raw_window_handle::RawWindowHandle::WebCanvas(handle) => {
+                let value: &JsValue = unsafe { handle.obj.cast().as_ref() };
+                value.clone().unchecked_into()
             }
-        }
+            raw_window_handle::RawWindowHandle::WebOffscreenCanvas(handle) => {
+                let value: &JsValue = unsafe { handle.obj.cast().as_ref() };
+                let canvas: web_sys::OffscreenCanvas = value.clone().unchecked_into();
+
+                return self.create_surface_from_offscreen_canvas(canvas);
+            }
+            _ => {
+                return Err(crate::InstanceError::new(format!(
+                    "window handle {window_handle:?} is not a web handle"
+                )))
+            }
+        };
+
+        self.create_surface_from_canvas(canvas)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Surface {
     canvas: Canvas,
-    webgl2_context: web_sys::WebGl2RenderingContext,
-    pub(super) swapchain: Option<Swapchain>,
-    texture: Option<glow::Texture>,
+    pub(super) webgl2_context: web_sys::WebGl2RenderingContext,
+    pub(super) swapchain: RwLock<Option<Swapchain>>,
+    texture: Mutex<Option<glow::Texture>>,
     pub(super) presentable: bool,
-    srgb_present_program: Option<glow::Program>,
+    srgb_present_program: Mutex<Option<glow::Program>>,
 }
+
+impl Clone for Surface {
+    fn clone(&self) -> Self {
+        Self {
+            canvas: self.canvas.clone(),
+            webgl2_context: self.webgl2_context.clone(),
+            swapchain: RwLock::new(self.swapchain.read().clone()),
+            texture: Mutex::new(*self.texture.lock()),
+            presentable: self.presentable,
+            srgb_present_program: Mutex::new(*self.srgb_present_program.lock()),
+        }
+    }
+}
+
+#[cfg(send_sync)]
+unsafe impl Sync for Surface {}
+#[cfg(send_sync)]
+unsafe impl Send for Surface {}
 
 #[derive(Clone, Debug)]
 enum Canvas {
     Canvas(web_sys::HtmlCanvasElement),
     Offscreen(web_sys::OffscreenCanvas),
 }
-
-// SAFE: Because web doesn't have threads ( yet )
-unsafe impl Sync for Surface {}
-unsafe impl Send for Surface {}
 
 #[derive(Clone, Debug)]
 pub struct Swapchain {
@@ -192,11 +224,13 @@ pub struct Swapchain {
 
 impl Surface {
     pub(super) unsafe fn present(
-        &mut self,
+        &self,
         _suf_texture: super::Texture,
-        gl: &glow::Context,
+        context: &AdapterContext,
     ) -> Result<(), crate::SurfaceError> {
-        let swapchain = self.swapchain.as_ref().ok_or(crate::SurfaceError::Other(
+        let gl = &context.glow_context;
+        let swapchain = self.swapchain.read();
+        let swapchain = swapchain.as_ref().ok_or(crate::SurfaceError::Other(
             "need to configure surface before presenting",
         ))?;
 
@@ -213,8 +247,8 @@ impl Surface {
             unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, None) };
             unsafe { gl.bind_sampler(0, None) };
             unsafe { gl.active_texture(glow::TEXTURE0) };
-            unsafe { gl.bind_texture(glow::TEXTURE_2D, self.texture) };
-            unsafe { gl.use_program(self.srgb_present_program) };
+            unsafe { gl.bind_texture(glow::TEXTURE_2D, *self.texture.lock()) };
+            unsafe { gl.use_program(*self.srgb_present_program.lock()) };
             unsafe { gl.disable(glow::DEPTH_TEST) };
             unsafe { gl.disable(glow::STENCIL_TEST) };
             unsafe { gl.disable(glow::SCISSOR_TEST) };
@@ -273,9 +307,11 @@ impl Surface {
     }
 }
 
-impl crate::Surface<super::Api> for Surface {
+impl crate::Surface for Surface {
+    type A = super::Api;
+
     unsafe fn configure(
-        &mut self,
+        &self,
         device: &super::Device,
         config: &crate::SurfaceConfiguration,
     ) -> Result<(), crate::SurfaceError> {
@@ -292,94 +328,108 @@ impl crate::Surface<super::Api> for Surface {
 
         let gl = &device.shared.context.lock();
 
-        if let Some(swapchain) = self.swapchain.take() {
-            // delete all frame buffers already allocated
-            unsafe { gl.delete_framebuffer(swapchain.framebuffer) };
+        {
+            let mut swapchain = self.swapchain.write();
+            if let Some(swapchain) = swapchain.take() {
+                // delete all frame buffers already allocated
+                unsafe { gl.delete_framebuffer(swapchain.framebuffer) };
+            }
+        }
+        {
+            let mut srgb_present_program = self.srgb_present_program.lock();
+            if srgb_present_program.is_none() && config.format.is_srgb() {
+                *srgb_present_program = Some(unsafe { Self::create_srgb_present_program(gl) });
+            }
+        }
+        {
+            let mut texture = self.texture.lock();
+            if let Some(texture) = texture.take() {
+                unsafe { gl.delete_texture(texture) };
+            }
+
+            *texture = Some(unsafe { gl.create_texture() }.map_err(|error| {
+                log::error!("Internal swapchain texture creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?);
+
+            let desc = device.shared.describe_texture_format(config.format);
+            unsafe { gl.bind_texture(glow::TEXTURE_2D, *texture) };
+            unsafe {
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MIN_FILTER,
+                    glow::NEAREST as _,
+                )
+            };
+            unsafe {
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    glow::TEXTURE_MAG_FILTER,
+                    glow::NEAREST as _,
+                )
+            };
+            unsafe {
+                gl.tex_storage_2d(
+                    glow::TEXTURE_2D,
+                    1,
+                    desc.internal,
+                    config.extent.width as i32,
+                    config.extent.height as i32,
+                )
+            };
+
+            let framebuffer = unsafe { gl.create_framebuffer() }.map_err(|error| {
+                log::error!("Internal swapchain framebuffer creation failed: {error}");
+                crate::DeviceError::OutOfMemory
+            })?;
+            unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
+            unsafe {
+                gl.framebuffer_texture_2d(
+                    glow::READ_FRAMEBUFFER,
+                    glow::COLOR_ATTACHMENT0,
+                    glow::TEXTURE_2D,
+                    *texture,
+                    0,
+                )
+            };
+            unsafe { gl.bind_texture(glow::TEXTURE_2D, None) };
+
+            let mut swapchain = self.swapchain.write();
+            *swapchain = Some(Swapchain {
+                extent: config.extent,
+                // channel: config.format.base_format().1,
+                format: config.format,
+                format_desc: desc,
+                framebuffer,
+            });
         }
 
-        if self.srgb_present_program.is_none() && config.format.is_srgb() {
-            self.srgb_present_program = Some(unsafe { Self::create_srgb_present_program(gl) });
-        }
-
-        if let Some(texture) = self.texture.take() {
-            unsafe { gl.delete_texture(texture) };
-        }
-
-        self.texture = Some(unsafe { gl.create_texture() }.map_err(|error| {
-            log::error!("Internal swapchain texture creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?);
-
-        let desc = device.shared.describe_texture_format(config.format);
-        unsafe { gl.bind_texture(glow::TEXTURE_2D, self.texture) };
-        unsafe {
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::NEAREST as _,
-            )
-        };
-        unsafe {
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::NEAREST as _,
-            )
-        };
-        unsafe {
-            gl.tex_storage_2d(
-                glow::TEXTURE_2D,
-                1,
-                desc.internal,
-                config.extent.width as i32,
-                config.extent.height as i32,
-            )
-        };
-
-        let framebuffer = unsafe { gl.create_framebuffer() }.map_err(|error| {
-            log::error!("Internal swapchain framebuffer creation failed: {error}");
-            crate::DeviceError::OutOfMemory
-        })?;
-        unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer)) };
-        unsafe {
-            gl.framebuffer_texture_2d(
-                glow::READ_FRAMEBUFFER,
-                glow::COLOR_ATTACHMENT0,
-                glow::TEXTURE_2D,
-                self.texture,
-                0,
-            )
-        };
-        unsafe { gl.bind_texture(glow::TEXTURE_2D, None) };
-
-        self.swapchain = Some(Swapchain {
-            extent: config.extent,
-            // channel: config.format.base_format().1,
-            format: config.format,
-            format_desc: desc,
-            framebuffer,
-        });
         Ok(())
     }
 
-    unsafe fn unconfigure(&mut self, device: &super::Device) {
+    unsafe fn unconfigure(&self, device: &super::Device) {
         let gl = device.shared.context.lock();
-        if let Some(swapchain) = self.swapchain.take() {
-            unsafe { gl.delete_framebuffer(swapchain.framebuffer) };
+        {
+            let mut swapchain = self.swapchain.write();
+            if let Some(swapchain) = swapchain.take() {
+                unsafe { gl.delete_framebuffer(swapchain.framebuffer) };
+            }
         }
-        if let Some(renderbuffer) = self.texture.take() {
+        if let Some(renderbuffer) = self.texture.lock().take() {
             unsafe { gl.delete_texture(renderbuffer) };
         }
     }
 
     unsafe fn acquire_texture(
-        &mut self,
-        _timeout_ms: Option<std::time::Duration>, //TODO
+        &self,
+        _timeout_ms: Option<core::time::Duration>, //TODO
+        _fence: &super::Fence,
     ) -> Result<Option<crate::AcquiredSurfaceTexture<super::Api>>, crate::SurfaceError> {
-        let sc = self.swapchain.as_ref().unwrap();
+        let swapchain = self.swapchain.read();
+        let sc = swapchain.as_ref().unwrap();
         let texture = super::Texture {
             inner: super::TextureInner::Texture {
-                raw: self.texture.unwrap(),
+                raw: self.texture.lock().unwrap(),
                 target: glow::TEXTURE_2D,
             },
             drop_guard: None,
@@ -392,7 +442,6 @@ impl crate::Surface<super::Api> for Surface {
                 height: sc.extent.height,
                 depth: 1,
             },
-            is_cubemap: false,
         };
         Ok(Some(crate::AcquiredSurfaceTexture {
             texture,
@@ -400,5 +449,5 @@ impl crate::Surface<super::Api> for Surface {
         }))
     }
 
-    unsafe fn discard_texture(&mut self, _texture: super::Texture) {}
+    unsafe fn discard_texture(&self, _texture: super::Texture) {}
 }

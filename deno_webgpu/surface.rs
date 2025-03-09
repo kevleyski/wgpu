@@ -1,154 +1,229 @@
-// Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use super::WebGpuResult;
-use deno_core::error::AnyError;
-use deno_core::include_js_files;
-use deno_core::op;
-use deno_core::Extension;
-use deno_core::ExtensionBuilder;
-use deno_core::OpState;
-use deno_core::Resource;
-use deno_core::ResourceId;
-use serde::Deserialize;
-use std::borrow::Cow;
-use std::rc::Rc;
+use std::cell::RefCell;
+
+use deno_core::op2;
+use deno_core::v8;
+use deno_core::GarbageCollected;
+use deno_core::WebIDL;
+use deno_core::_ops::make_cppgc_object;
+use deno_core::cppgc::Ptr;
+use deno_error::JsErrorBox;
 use wgpu_types::SurfaceStatus;
 
-fn ext() -> ExtensionBuilder {
-    Extension::builder_with_deps(
-        "deno_webgpu_surface",
-        &["deno_webidl", "deno_web", "deno_webgpu"],
-    )
+use crate::device::GPUDevice;
+use crate::texture::GPUTexture;
+use crate::texture::GPUTextureFormat;
+
+#[derive(Debug, thiserror::Error, deno_error::JsError)]
+pub enum SurfaceError {
+    #[class("DOMExceptionInvalidStateError")]
+    #[error("Context is not configured")]
+    UnconfiguredContext,
+    #[class(generic)]
+    #[error("Invalid Surface Status")]
+    InvalidStatus,
+    #[class(generic)]
+    #[error(transparent)]
+    Surface(#[from] wgpu_core::present::SurfaceError),
 }
 
-fn ops(ext: &mut ExtensionBuilder, unstable: bool) -> &mut ExtensionBuilder {
-    ext.ops(vec![
-        op_webgpu_surface_configure::decl(),
-        op_webgpu_surface_get_current_texture::decl(),
-        op_webgpu_surface_present::decl(),
-    ])
-    .state(move |state| {
-        // TODO: check & possibly streamline this
-        // Unstable might be able to be OpMiddleware
-        // let unstable_checker = state.borrow::<super::UnstableChecker>();
-        // let unstable = unstable_checker.unstable;
-        state.put(super::Unstable(unstable));
-    })
+pub struct Configuration {
+    pub device: Ptr<GPUDevice>,
+    pub usage: u32,
+    pub format: GPUTextureFormat,
 }
 
-pub fn init_ops_and_esm(unstable: bool) -> Extension {
-    ops(&mut ext(), unstable)
-        .esm(include_js_files!(
-            "03_surface.js",
-            "04_surface_idl_types.js",
-        ))
-        .build()
+pub struct GPUCanvasContext {
+    pub surface_id: wgpu_core::id::SurfaceId,
+    pub width: RefCell<u32>,
+    pub height: RefCell<u32>,
+
+    pub config: RefCell<Option<Configuration>>,
+    pub texture: RefCell<Option<v8::Global<v8::Object>>>,
+
+    pub canvas: v8::Global<v8::Object>,
 }
 
-pub fn init_ops(unstable: bool) -> Extension {
-    ops(&mut ext(), unstable).build()
-}
+impl GarbageCollected for GPUCanvasContext {}
 
-pub struct WebGpuSurface(pub crate::Instance, pub wgpu_core::id::SurfaceId);
-impl Resource for WebGpuSurface {
-    fn name(&self) -> Cow<str> {
-        "webGPUSurface".into()
+#[op2]
+impl GPUCanvasContext {
+    #[getter]
+    #[global]
+    fn canvas(&self) -> v8::Global<v8::Object> {
+        self.canvas.clone()
     }
 
-    fn close(self: Rc<Self>) {
-        self.0.surface_drop(self.1);
+    fn configure(&self, #[webidl] configuration: GPUCanvasConfiguration) -> Result<(), JsErrorBox> {
+        let usage = wgpu_types::TextureUsages::from_bits(configuration.usage)
+            .ok_or_else(|| JsErrorBox::type_error("usage is not valid"))?;
+        let format = configuration.format.clone().into();
+        let conf = wgpu_types::SurfaceConfiguration {
+            usage,
+            format,
+            width: *self.width.borrow(),
+            height: *self.height.borrow(),
+            present_mode: configuration
+                .present_mode
+                .map(Into::into)
+                .unwrap_or_default(),
+            alpha_mode: configuration.alpha_mode.into(),
+            view_formats: configuration
+                .view_formats
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            desired_maximum_frame_latency: 2,
+        };
+
+        let device = configuration.device;
+
+        let err = device
+            .instance
+            .surface_configure(self.surface_id, device.id, &conf);
+
+        device.error_handler.push_error(err);
+
+        self.config.borrow_mut().replace(Configuration {
+            device,
+            usage: configuration.usage,
+            format: configuration.format,
+        });
+
+        Ok(())
     }
-}
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SurfaceConfigureArgs {
-    surface_rid: ResourceId,
-    device_rid: ResourceId,
-    format: wgpu_types::TextureFormat,
-    usage: u32,
-    width: u32,
-    height: u32,
-    present_mode: Option<wgpu_types::PresentMode>,
-    alpha_mode: wgpu_types::CompositeAlphaMode,
-    view_formats: Vec<wgpu_types::TextureFormat>,
-}
+    #[fast]
+    fn unconfigure(&self) {
+        *self.config.borrow_mut() = None;
+    }
 
-#[op]
-pub fn op_webgpu_surface_configure(
-    state: &mut OpState,
-    args: SurfaceConfigureArgs,
-) -> Result<WebGpuResult, AnyError> {
-    let instance = state.borrow::<super::Instance>();
-    let device_resource = state
-        .resource_table
-        .get::<super::WebGpuDevice>(args.device_rid)?;
-    let device = device_resource.1;
-    let surface_resource = state
-        .resource_table
-        .get::<WebGpuSurface>(args.surface_rid)?;
-    let surface = surface_resource.1;
+    #[global]
+    fn get_current_texture(
+        &self,
+        scope: &mut v8::HandleScope,
+    ) -> Result<v8::Global<v8::Object>, SurfaceError> {
+        let config = self.config.borrow();
+        let Some(config) = config.as_ref() else {
+            return Err(SurfaceError::UnconfiguredContext);
+        };
 
-    let conf = wgpu_types::SurfaceConfiguration::<Vec<wgpu_types::TextureFormat>> {
-        usage: wgpu_types::TextureUsages::from_bits_truncate(args.usage),
-        format: args.format,
-        width: args.width,
-        height: args.height,
-        present_mode: args.present_mode.unwrap_or_default(),
-        alpha_mode: args.alpha_mode,
-        view_formats: args.view_formats,
-    };
-
-    let err = gfx_select!(device => instance.surface_configure(surface, device, &conf));
-
-    Ok(WebGpuResult::maybe_err(err))
-}
-
-#[op]
-pub fn op_webgpu_surface_get_current_texture(
-    state: &mut OpState,
-    device_rid: ResourceId,
-    surface_rid: ResourceId,
-) -> Result<WebGpuResult, AnyError> {
-    let instance = state.borrow::<super::Instance>();
-    let device_resource = state
-        .resource_table
-        .get::<super::WebGpuDevice>(device_rid)?;
-    let device = device_resource.1;
-    let surface_resource = state.resource_table.get::<WebGpuSurface>(surface_rid)?;
-    let surface = surface_resource.1;
-
-    let output = gfx_select!(device => instance.surface_get_current_texture(surface, ()))?;
-
-    match output.status {
-        SurfaceStatus::Good | SurfaceStatus::Suboptimal => {
-            let id = output.texture_id.unwrap();
-            let rid = state.resource_table.add(crate::texture::WebGpuTexture {
-                instance: instance.clone(),
-                id,
-                owned: false,
-            });
-            Ok(WebGpuResult::rid(rid))
+        {
+            if let Some(obj) = self.texture.borrow().as_ref() {
+                return Ok(obj.clone());
+            }
         }
-        _ => Err(AnyError::msg("Invalid Surface Status")),
+
+        let output = config
+            .device
+            .instance
+            .surface_get_current_texture(self.surface_id, None)?;
+
+        match output.status {
+            SurfaceStatus::Good | SurfaceStatus::Suboptimal => {
+                let id = output.texture.unwrap();
+
+                let texture = GPUTexture {
+                    instance: config.device.instance.clone(),
+                    error_handler: config.device.error_handler.clone(),
+                    id,
+                    label: "".to_string(),
+                    size: wgpu_types::Extent3d {
+                        width: *self.width.borrow(),
+                        height: *self.height.borrow(),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 0,
+                    sample_count: 0,
+                    dimension: crate::texture::GPUTextureDimension::D2,
+                    format: config.format.clone(),
+                    usage: config.usage,
+                };
+                let obj = make_cppgc_object(scope, texture);
+                let obj = v8::Global::new(scope, obj);
+                *self.texture.borrow_mut() = Some(obj.clone());
+
+                Ok(obj)
+            }
+            _ => Err(SurfaceError::InvalidStatus),
+        }
     }
 }
 
-#[op]
-pub fn op_webgpu_surface_present(
-    state: &mut OpState,
-    device_rid: ResourceId,
-    surface_rid: ResourceId,
-) -> Result<(), AnyError> {
-    let instance = state.borrow::<super::Instance>();
-    let device_resource = state
-        .resource_table
-        .get::<super::WebGpuDevice>(device_rid)?;
-    let device = device_resource.1;
-    let surface_resource = state.resource_table.get::<WebGpuSurface>(surface_rid)?;
-    let surface = surface_resource.1;
+impl GPUCanvasContext {
+    pub fn present(&self) -> Result<(), SurfaceError> {
+        let config = self.config.borrow();
+        let Some(config) = config.as_ref() else {
+            return Err(SurfaceError::UnconfiguredContext);
+        };
 
-    let _ = gfx_select!(device => instance.surface_present(surface))?;
+        config.device.instance.surface_present(self.surface_id)?;
 
-    Ok(())
+        Ok(())
+    }
+}
+
+#[derive(WebIDL)]
+#[webidl(dictionary)]
+struct GPUCanvasConfiguration {
+    device: Ptr<GPUDevice>,
+    format: GPUTextureFormat,
+    #[webidl(default = wgpu_types::TextureUsages::RENDER_ATTACHMENT.bits())]
+    #[options(enforce_range = true)]
+    usage: u32,
+    #[webidl(default = GPUCanvasAlphaMode::Opaque)]
+    alpha_mode: GPUCanvasAlphaMode,
+
+    // Extended from spec
+    present_mode: Option<GPUPresentMode>,
+    #[webidl(default = vec![])]
+    view_formats: Vec<GPUTextureFormat>,
+}
+
+#[derive(WebIDL)]
+#[webidl(enum)]
+enum GPUCanvasAlphaMode {
+    Opaque,
+    Premultiplied,
+}
+
+impl From<GPUCanvasAlphaMode> for wgpu_types::CompositeAlphaMode {
+    fn from(value: GPUCanvasAlphaMode) -> Self {
+        match value {
+            GPUCanvasAlphaMode::Opaque => Self::Opaque,
+            GPUCanvasAlphaMode::Premultiplied => Self::PreMultiplied,
+        }
+    }
+}
+
+// Extended from spec
+#[derive(WebIDL)]
+#[webidl(enum)]
+enum GPUPresentMode {
+    #[webidl(rename = "autoVsync")]
+    AutoVsync,
+    #[webidl(rename = "autoNoVsync")]
+    AutoNoVsync,
+    #[webidl(rename = "fifo")]
+    Fifo,
+    #[webidl(rename = "fifoRelaxed")]
+    FifoRelaxed,
+    #[webidl(rename = "immediate")]
+    Immediate,
+    #[webidl(rename = "mailbox")]
+    Mailbox,
+}
+
+impl From<GPUPresentMode> for wgpu_types::PresentMode {
+    fn from(value: GPUPresentMode) -> Self {
+        match value {
+            GPUPresentMode::AutoVsync => Self::AutoVsync,
+            GPUPresentMode::AutoNoVsync => Self::AutoNoVsync,
+            GPUPresentMode::Fifo => Self::Fifo,
+            GPUPresentMode::FifoRelaxed => Self::FifoRelaxed,
+            GPUPresentMode::Immediate => Self::Immediate,
+            GPUPresentMode::Mailbox => Self::Mailbox,
+        }
+    }
 }

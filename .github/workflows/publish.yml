@@ -1,68 +1,65 @@
 name: Publish
 
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/publish.yml'
   push:
     branches:
-      - gecko
+      - trunk
 
 env:
   CARGO_INCREMENTAL: false
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  RUSTFLAGS: --cfg=web_sys_unstable_apis
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the code
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
       - name: Install Rust WASM target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Install wasm-bindgen-cli
-        run: cargo install wasm-bindgen-cli --version=0.2.83
-
-      - name: Build WebGPU examples
-        run: cargo build --package wgpu --release --target wasm32-unknown-unknown --examples
-
-      - name: Generate JS bindings for WebGPU examples
+      - name: Get `wasm-bindgen` version
         run: |
-          for i in target/wasm32-unknown-unknown/release/examples/*.wasm;
-          do
-            wasm-bindgen --no-typescript --out-dir target/generated-gpu --web "$i";
-          done
+          WASM_BINDGEN_VERSION=$(cargo metadata --format-version 1 --all-features | jq '.packages[] | select(.name == "wasm-bindgen") | .version' | tr -d '"')
+
+          echo $WASM_BINDGEN_VERSION
+
+          echo "WASM_BINDGEN_VERSION=$WASM_BINDGEN_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install `wasm-bindgen`
+        run: cargo +stable install wasm-bindgen-cli --version=$WASM_BINDGEN_VERSION
+
+      - name: Debug symbols to line-tables-only
+        shell: bash
+        run: |
+          mkdir -p .cargo
+
+          cat <<EOF >> .cargo/config.toml
+            [profile.dev]
+            debug = "line-tables-only"
+          EOF
+
+      - name: Caching
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-build
+
+      - name: Build examples
+        run: cargo xtask run-wasm --no-serve
 
       - name: Deploy WebGPU examples
-        uses: JamesIves/github-pages-deploy-action@v4.4.1
+        uses: JamesIves/github-pages-deploy-action@v4.7.3
+        if: github.ref == 'refs/heads/trunk'
         with:
           token: ${{ secrets.WEB_DEPLOY }}
-          folder: target/generated-gpu
+          folder: target/generated
           repository-name: gfx-rs/wgpu-rs.github.io
           branch: master
-          target-folder: examples-gpu/wasm
-
-      - name: Clean the build
-        run: cargo clean
-
-      - name: Build WebGL examples
-        run: cargo build --release --target wasm32-unknown-unknown --examples --features webgl
-
-      - name: Generate JS bindings for WebGL examples
-        run: |
-          for i in target/wasm32-unknown-unknown/release/examples/*.wasm;
-          do
-            wasm-bindgen --no-typescript --out-dir target/generated-gl --web "$i";
-          done
-
-      - name: Deploy WebGL examples
-        uses: JamesIves/github-pages-deploy-action@v4.4.1
-        with:
-          token: ${{ secrets.WEB_DEPLOY }}
-          folder: target/generated-gl
-          repository-name: gfx-rs/wgpu-rs.github.io
-          branch: master
-          target-folder: examples-gl/wasm
+          target-folder: examples/

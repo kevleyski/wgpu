@@ -1,10 +1,11 @@
 use super::{InitTracker, MemoryInitKind};
-use crate::id::BufferId;
-use std::ops::Range;
+use crate::resource::Buffer;
+use alloc::sync::Arc;
+use core::ops::Range;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BufferInitTrackerAction {
-    pub id: BufferId,
+    pub buffer: Arc<Buffer>,
     pub range: Range<wgt::BufferAddress>,
     pub kind: MemoryInitKind,
 }
@@ -18,18 +19,22 @@ impl BufferInitTracker {
         &self,
         action: &BufferInitTrackerAction,
     ) -> Option<BufferInitTrackerAction> {
-        self.create_action(action.id, action.range.clone(), action.kind)
+        self.create_action(&action.buffer, action.range.clone(), action.kind)
     }
 
     /// Creates an action if it would have any effect on the initialization
     /// status and shrinks the range if possible.
     pub(crate) fn create_action(
         &self,
-        id: BufferId,
+        buffer: &Arc<Buffer>,
         query_range: Range<wgt::BufferAddress>,
         kind: MemoryInitKind,
     ) -> Option<BufferInitTrackerAction> {
         self.check(query_range)
-            .map(|range| BufferInitTrackerAction { id, range, kind })
+            .map(|range| BufferInitTrackerAction {
+                buffer: buffer.clone(),
+                range,
+                kind,
+            })
     }
 }

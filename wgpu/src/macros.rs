@@ -37,7 +37,7 @@ fn test_vertex_attr_array() {
     assert_eq!(attrs.len(), 2);
     assert_eq!(attrs[0].offset, 0);
     assert_eq!(attrs[0].shader_location, 0);
-    assert_eq!(attrs[1].offset, std::mem::size_of::<(f32, f32)>() as u64);
+    assert_eq!(attrs[1].offset, size_of::<(f32, f32)>() as u64);
     assert_eq!(attrs[1].shader_location, 3);
 }
 
@@ -71,23 +71,39 @@ macro_rules! include_spirv_raw {
         {
             //log::info!("including '{}'", $($token)*);
             $crate::ShaderModuleDescriptorSpirV {
-                label: Some($($token)*),
-                source: $crate::util::make_spirv_raw(include_bytes!($($token)*)),
+                label: $crate::__macro_helpers::Some($($token)*),
+                source: $crate::util::make_spirv_raw($crate::__macro_helpers::include_bytes!($($token)*)),
             }
         }
     };
 }
 
-/// Macro to load a WGSL module statically.
+/// Load WGSL source code from a file at compile time.
+///
+/// The loaded path is relative to the path of the file containing the macro call, in the same way
+/// as [`include_str!`] operates.
+///
+/// ```ignore
+/// fn main() {
+///     let module: ShaderModuleDescriptor = include_wgsl!("shader.wgsl");
+/// }
+/// ```
 #[macro_export]
 macro_rules! include_wgsl {
     ($($token:tt)*) => {
         {
             //log::info!("including '{}'", $($token)*);
             $crate::ShaderModuleDescriptor {
-                label: Some($($token)*),
-                source: $crate::ShaderSource::Wgsl(include_str!($($token)*).into()),
+                label: $crate::__macro_helpers::Some($($token)*),
+                source: $crate::ShaderSource::Wgsl($crate::__macro_helpers::Cow::Borrowed($crate::__macro_helpers::include_str!($($token)*))),
             }
         }
     };
+}
+
+#[doc(hidden)]
+pub mod helpers {
+    pub use alloc::borrow::Cow;
+    pub use core::{include_bytes, include_str};
+    pub use Some;
 }
